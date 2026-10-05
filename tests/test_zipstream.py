@@ -17,7 +17,7 @@ import zlib
 import pytest
 
 import zipstream
-from zipstream import ZipStream
+from zipstream import SeekableZipStream, ZipStream, ZipStreamInfo
 
 
 PY313 = sys.version_info < (3, 14)
@@ -1766,3 +1766,244 @@ def test_zip64_real(tmpdir):
 
         with zf.open("small.bin", "r") as fp:
             assert smalldata == fp.read()
+
+
+class _TrackingSeekableFile:
+    def __init__(self, path):
+        self.fp = open(str(path), "rb")
+        self.reads = []
+        self.read_count = 0
+
+    def seekable(self):
+        return True
+
+    def fileno(self):
+        return self.fp.fileno()
+
+    def tell(self):
+        return self.fp.tell()
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        return self.fp.seek(offset, whence)
+
+    def read(self, size=-1):
+        start = self.fp.tell()
+        data = self.fp.read(size)
+        self.reads.append((start, start + len(data)))
+        self.read_count += 1
+        return data
+
+    def close(self):
+        self.fp.close()
+
+
+def _merge_intervals(intervals):
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _make_seekable_fixture(tmp_path, monkeypatch=None, force_zip64=False):
+    if force_zip64:
+        monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 100)
+        monkeypatch.setattr(zipstream.ng, "ZIP64_LIMIT", 100)
+
+    root = tmp_path / "seekable"
+    root.mkdir()
+    directory = root / "目录"
+    directory.mkdir()
+    specs = [
+        ("empty.bin", 0),
+        ("one.bin", 1),
+        ("small-ünïcode.bin", 37),
+        ("large-ünïcode.bin", 4096),
+    ]
+    created = []
+    when = time.mktime((2021, 2, 3, 4, 5, 6, 0, 0, -1))
+
+    for name, size in specs:
+        path = root / name
+        data = _randbytes(size)
+        path.write_bytes(data)
+        os.utime(str(path), (when, when))
+        created.append((path, data))
+    os.utime(str(directory), (when, when))
+
+    normal = ZipStream()
+    normal.comment = "archive comment 注释"
+    normal.add_path(str(directory), "目录")
+    for path, _ in created:
+        normal.add_path(str(path))
+
+    view = SeekableZipStream(comment=normal.comment)
+    directory_info = ZipStreamInfo("目录/", time.localtime(when)[0:6])
+    directory_stat = os.stat(str(directory))
+    directory_info.external_attr = (directory_stat.st_mode & 0xFFFF) << 16
+    directory_info.external_attr |= zipstream.ng._FLAG_IS_DIRECTORY
+    view.add(directory_info)
+
+    sources = []
+    for path, data in created:
+        zinfo = ZipStreamInfo(path.name, time.localtime(when)[0:6])
+        stat_result = os.stat(str(path))
+        zinfo.external_attr = (stat_result.st_mode & 0xFFFF) << 16
+        zinfo.file_size = len(data)
+        zinfo.CRC = zlib.crc32(data) & 0xFFFFFFFF
+        source = _TrackingSeekableFile(path)
+        sources.append((data, source))
+        view.add(zinfo, source)
+
+    view.finalize()
+    return normal, view, directory, created, sources
+
+
+@pytest.mark.parametrize("force_zip64", [False, True])
+def test_seekable_stored_zip_ranges(tmp_path, monkeypatch, force_zip64):
+    normal, view, directory, created, sources = _make_seekable_fixture(
+        tmp_path, monkeypatch, force_zip64
+    )
+    expected = bytes(normal)
+
+    assert len(view) == len(expected)
+    assert zipfile.is_zipfile(io.BytesIO(view.read_range(0, len(view))))
+
+    first_data_start = min(
+        segment.start for segment in view.segments if segment.kind == "data"
+    )
+    for source in (x[1] for x in sources):
+        source.reads = []
+        source.read_count = 0
+    header_only = view.read_range(0, first_data_start)
+    assert header_only == expected[:first_data_start]
+    assert all(source.read_count == 0 for _, source in sources)
+
+    boundaries = {0, len(view)}
+    for segment in view.segments:
+        boundaries.update((segment.start, segment.end))
+    boundaries = sorted(boundaries)
+
+    ranges = []
+    cursor = 0
+    rng = random.Random(1234)
+    while cursor < len(view):
+        index = boundaries.index(cursor)
+        if index + 2 >= len(boundaries):
+            end = len(view)
+        else:
+            end = rng.choice(boundaries[index + 2:])
+        ranges.append((cursor, end))
+        cursor = end
+
+    assert len(ranges) > 1
+    rng.shuffle(ranges)
+    output = bytearray(len(view))
+    for start, end in ranges:
+        output[start:end] = view.read_range(start, end)
+
+    assert bytes(output) == expected
+
+    for (_, source), (path, data) in zip(sources, created):
+        for start, end in source.reads:
+            assert 0 <= start <= end <= len(data)
+        if data:
+            assert _merge_intervals(source.reads) == [(0, len(data))]
+        else:
+            assert source.reads == []
+
+    kinds = {segment.kind for segment in view.segments}
+    assert "local_header" in kinds
+    assert "data" in kinds
+    assert "data_descriptor" in kinds
+    assert "central_directory_header" in kinds
+    assert "end_of_central_directory" in kinds
+    if force_zip64:
+        assert "zip64_end_of_central_directory" in kinds
+
+    for source in (x[1] for x in sources):
+        source.close()
+
+
+def test_seekable_stored_zip_file_interface_and_source_change(tmp_path):
+    normal, view, _, created, sources = _make_seekable_fixture(tmp_path)
+    expected = bytes(normal)
+
+    assert view.seek(10) == 10
+    assert view.tell() == 10
+    assert view.read(5) == expected[10:15]
+    assert view.tell() == 15
+    assert view.seek(-5, os.SEEK_END) == len(view) - 5
+    assert view.read() == expected[-5:]
+    assert view.read() == b""
+
+    path, data = created[1]
+    segment = next(
+        segment for segment in view.segments
+        if segment.kind == "data" and segment.entry.filename == os.path.basename(str(path))
+    )
+    assert view.read_range(segment.start, segment.end) == data
+
+    path.write_bytes(bytes((data[0] ^ 0xFF,)) + data[1:])
+    os.utime(str(path), (time.time() + 10, time.time() + 10))
+    with pytest.raises(RuntimeError, match="has changed"):
+        view.read_range(segment.start, segment.end)
+
+    for source in (x[1] for x in sources):
+        source.close()
+
+
+def test_seekable_stored_zip_validates_metadata_and_versions():
+    zinfo = ZipStreamInfo("deflated.bin")
+    zinfo.compress_type = zipfile.ZIP_DEFLATED
+    view = SeekableZipStream()
+    with pytest.raises(ValueError, match="ZIP_STORED"):
+        view.add(zinfo, io.BytesIO(b"data"))
+
+    source = io.BytesIO(b"data")
+    versions = {"value": 1}
+    zinfo = ZipStreamInfo("stored.bin")
+    zinfo.file_size = 4
+    zinfo.CRC = zlib.crc32(b"data") & 0xFFFFFFFF
+    view = SeekableZipStream()
+    view.add(zinfo, source, version=lambda: versions["value"])
+    view.finalize()
+    archive = view.read_range(0, len(view))
+    assert zipfile.ZipFile(io.BytesIO(archive)).read("stored.bin") == b"data"
+    versions["value"] = 2
+    with pytest.raises(RuntimeError, match="has changed"):
+        view.read_range(0, len(archive))
+
+
+def test_seekable_stored_zip_requires_half_open_bounds(tmp_path):
+    _, view, _, _, sources = _make_seekable_fixture(tmp_path)
+    with pytest.raises(ValueError):
+        view.read_range(-1, 1)
+    with pytest.raises(ValueError):
+        view.read_range(0, len(view) + 1)
+    with pytest.raises(ValueError):
+        view.read_range(5, 4)
+    for source in (x[1] for x in sources):
+        source.close()
+
+
+def test_seekable_stored_zip_accepts_path_like_source(tmp_path):
+    path = tmp_path / "stored.bin"
+    data = b"path-like source data"
+    path.write_bytes(data)
+
+    zinfo = ZipStreamInfo("stored.bin")
+    zinfo.file_size = len(data)
+    zinfo.CRC = zlib.crc32(data) & 0xFFFFFFFF
+
+    view = SeekableZipStream()
+    view.add(zinfo, path)
+    view.finalize()
+
+    archive = view.read_range(0, len(view))
+    assert zipfile.ZipFile(io.BytesIO(archive)).read("stored.bin") == data

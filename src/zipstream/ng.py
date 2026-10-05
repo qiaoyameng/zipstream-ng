@@ -2,10 +2,13 @@
 
 """A modern and easy to use streamable zip file generator"""
 
+import bisect
 import collections
+import copy
 import datetime
 import errno
 import functools
+import io
 import logging
 import os
 import stat
@@ -71,7 +74,7 @@ if not PY313_COMPAT:
 
 __all__ = [
     # Defined classes
-    "ZipStream", "ZipStreamInfo",
+    "ZipStream", "ZipStreamInfo", "SeekableZipStream",
     # Compression constants (imported from zipfile)
     "ZIP_STORED",
     "ZIP_DEFLATED",
@@ -422,6 +425,427 @@ class ZipStreamInfo(ZipInfo):
         def is_dir(self):
             """Return True if this archive member is a directory."""
             return self.filename[-1] == '/'
+
+_LayoutSegment = collections.namedtuple(
+    "_LayoutSegment",
+    ("start", "end", "kind", "data", "source", "entry")
+)
+
+
+class _StoredSource:
+    """A seekable source of bytes for one stored ZIP entry"""
+
+    def __init__(self, source, size, name, version=None):
+        self.name = name
+        self.size = size
+        self.version = version
+        self.path = None
+        self.stream = None
+        self.lock = threading.Lock()
+
+        if isinstance(source, (bytes, bytearray)):
+            source = io.BytesIO(bytes(source))
+
+        is_path = isinstance(source, str)
+        if not is_path:
+            if PY35_COMPAT:
+                if hasattr(source, "__fspath__"):
+                    source = source.__fspath__()
+            elif isinstance(source, os.PathLike):
+                source = os.fspath(source)
+            is_path = isinstance(source, (str, bytes))
+
+        if is_path:
+            self.path = source
+            stat_result = os.stat(self.path)
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise ValueError("source for '{}' is not a regular file".format(name))
+            if stat_result.st_size != size:
+                raise ValueError("source size for '{}' does not match its metadata".format(name))
+            self.kind = "path"
+        else:
+            if not all(hasattr(source, x) for x in ("seek", "tell", "read")):
+                raise TypeError("source for '{}' must be seekable".format(name))
+            seekable = getattr(source, "seekable", None)
+            if seekable is not None and not seekable():
+                raise ValueError("source for '{}' must be seekable".format(name))
+
+            self.stream = source
+            try:
+                fileno = source.fileno()
+            except (AttributeError, OSError, io.UnsupportedOperation):
+                fileno = None
+
+            if fileno is not None:
+                stat_result = os.fstat(fileno)
+                if stat_result.st_size != size:
+                    raise ValueError("source size for '{}' does not match its metadata".format(name))
+                self.kind = "fileno"
+            else:
+                position = source.tell()
+                source.seek(0, os.SEEK_END)
+                actual_size = source.tell()
+                source.seek(position, os.SEEK_SET)
+                if actual_size != size:
+                    raise ValueError("source size for '{}' does not match its metadata".format(name))
+                self.kind = "stream"
+
+        self.fingerprint = self.current_fingerprint()
+
+    def _version_value(self):
+        if self.version is None:
+            return None
+        if callable(self.version):
+            return self.version()
+        return self.version
+
+    def _stat_fingerprint(self, stat_result):
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            getattr(stat_result, "st_ctime_ns", None),
+            self._version_value(),
+        )
+
+    def current_fingerprint(self):
+        if self.kind == "path":
+            return self._stat_fingerprint(os.stat(self.path))
+        if self.kind == "fileno":
+            return self._stat_fingerprint(os.fstat(self.stream.fileno()))
+
+        position = self.stream.tell()
+        self.stream.seek(0, os.SEEK_END)
+        size = self.stream.tell()
+        self.stream.seek(position, os.SEEK_SET)
+        return (id(self.stream), size, self._version_value())
+
+    def check_fingerprint(self):
+        current = self.current_fingerprint()
+        if current != self.fingerprint:
+            raise RuntimeError("source for '{}' has changed".format(self.name))
+
+    def iter_range(self, start, end, chunk_size=READ_BUFFER):
+        if not 0 <= start <= end <= self.size:
+            raise ValueError("source range is outside of '{}'".format(self.name))
+        if start == end:
+            return
+
+        if self.kind == "path":
+            fp = open(self.path, "rb")
+            try:
+                fingerprint = self._stat_fingerprint(os.fstat(fp.fileno()))
+                if fingerprint != self.fingerprint:
+                    raise RuntimeError("source for '{}' has changed".format(self.name))
+                fp.seek(start, os.SEEK_SET)
+                remaining = end - start
+                while remaining:
+                    buf = fp.read(min(chunk_size, remaining))
+                    if not buf:
+                        raise EOFError("unexpected end of source for '{}'".format(self.name))
+                    if len(buf) > remaining:
+                        raise IOError("source for '{}' returned too much data".format(self.name))
+                    remaining -= len(buf)
+                    yield buf
+                fingerprint = self._stat_fingerprint(os.fstat(fp.fileno()))
+                if fingerprint != self.fingerprint:
+                    raise RuntimeError("source for '{}' has changed".format(self.name))
+            finally:
+                fp.close()
+            return
+
+        with self.lock:
+            self.check_fingerprint()
+            position = self.stream.tell()
+            try:
+                self.stream.seek(start, os.SEEK_SET)
+                remaining = end - start
+                while remaining:
+                    buf = self.stream.read(min(chunk_size, remaining))
+                    if not buf:
+                        raise EOFError("unexpected end of source for '{}'".format(self.name))
+                    if not isinstance(buf, (bytes, bytearray)):
+                        raise TypeError("source for '{}' must return bytes".format(self.name))
+                    if len(buf) > remaining:
+                        raise IOError("source for '{}' returned too much data".format(self.name))
+                    remaining -= len(buf)
+                    yield bytes(buf)
+                self.check_fingerprint()
+            finally:
+                self.stream.seek(position, os.SEEK_SET)
+
+
+class SeekableZipStream(io.BufferedIOBase):
+    """A seekable virtual view of a ZIP_STORED archive"""
+
+    def __init__(self, comment=b""):
+        self._entries = []
+        self._sources = []
+        self._segments = ()
+        self._segment_starts = ()
+        self._size = 0
+        self._final = False
+        self._pos = 0
+        self._read_lock = threading.Lock()
+        self.comment = comment
+
+    @property
+    def comment(self):
+        return self._comment
+
+    @comment.setter
+    def comment(self, comment):
+        if self._final:
+            raise RuntimeError("SeekableZipStream has already been finalized")
+        if comment is None:
+            comment = b""
+        elif isinstance(comment, str):
+            comment = comment.encode("utf-8")
+        elif isinstance(comment, bytearray):
+            comment = bytes(comment)
+        if not isinstance(comment, bytes):
+            raise TypeError("Expected bytes, got {}".format(type(comment).__name__))
+        if len(comment) > ZIP_MAX_COMMENT:
+            __log__.warning(
+                "Archive comment is too long; truncating to %d bytes",
+                ZIP_MAX_COMMENT
+            )
+            comment = comment[:ZIP_MAX_COMMENT]
+        self._comment = comment
+
+    @property
+    def finalized(self):
+        return self._final
+
+    @property
+    def size(self):
+        if not self._final:
+            raise RuntimeError("SeekableZipStream has not been finalized")
+        return self._size
+
+    @property
+    def segments(self):
+        if not self._final:
+            raise RuntimeError("SeekableZipStream has not been finalized")
+        return self._segments
+
+    def readable(self):
+        return self._final
+
+    def seekable(self):
+        return self._final
+
+    def add(self, zinfo, source=None, *, version=None):
+        """Add an entry with fixed metadata and a seekable stored-data source"""
+        if self._final:
+            raise RuntimeError("SeekableZipStream has already been finalized")
+        if not isinstance(zinfo, ZipInfo):
+            raise TypeError("zinfo must be a zipfile.ZipInfo instance")
+        if zinfo.compress_type != ZIP_STORED:
+            raise ValueError("SeekableZipStream only supports ZIP_STORED entries")
+
+        entry = copy.copy(zinfo)
+        entry.extra = bytes(entry.extra)
+        entry.comment = bytes(entry.comment)
+        crc = getattr(entry, "CRC", 0)
+        if not isinstance(crc, int) or not 0 <= crc <= 0xFFFFFFFF:
+            raise ValueError("CRC for '{}' must be an unsigned 32-bit integer".format(entry.filename))
+        if not isinstance(entry.file_size, int) or entry.file_size < 0:
+            raise ValueError("file_size for '{}' must be a non-negative integer".format(entry.filename))
+
+        is_directory = entry.filename.endswith("/")
+        if is_directory:
+            if source is not None:
+                raise ValueError("directory entry '{}' cannot have a source".format(entry.filename))
+            entry.file_size = 0
+            entry.compress_size = 0
+            entry.CRC = 0
+            entry.flag_bits &= ~_FLAG_DATA_DESCRIPTOR
+            stored_source = None
+        else:
+            if source is None:
+                raise ValueError("a source is required for file entry '{}'".format(entry.filename))
+            entry.compress_size = entry.file_size
+            entry.CRC = crc
+            entry.flag_bits |= _FLAG_DATA_DESCRIPTOR
+            stored_source = _StoredSource(source, entry.file_size, entry.filename, version)
+
+        self._entries.append(entry)
+        self._sources.append(stored_source)
+        return self
+
+    def finalize(self):
+        """Calculate the immutable virtual archive layout"""
+        if self._final:
+            return self
+
+        segments = []
+        pos = 0
+        entry_layouts = []
+
+        def append_static(kind, data, entry=None, source=None):
+            nonlocal pos
+            if not data:
+                return
+            start = pos
+            pos += len(data)
+            segments.append(_LayoutSegment(start, pos, kind, data, source, entry))
+
+        for entry, source in zip(self._entries, self._sources):
+            entry.header_offset = pos
+            is_directory = entry.filename.endswith("/")
+            uses_zip64 = (
+                not is_directory and
+                entry.file_size * ZIP64_ESTIMATE_FACTOR > ZIP64_LIMIT
+            )
+            layout_entry = copy.copy(entry)
+            local_entry = copy.copy(entry)
+            local_header = local_entry.FileHeader(uses_zip64)
+            layout_entry.extract_version = local_entry.extract_version
+            layout_entry.create_version = local_entry.create_version
+            entry.extract_version = local_entry.extract_version
+            entry.create_version = local_entry.create_version
+            entry_layouts.append((layout_entry, uses_zip64))
+            append_static("local_header", local_header, layout_entry, source)
+
+            if not is_directory:
+                start = pos
+                pos += entry.file_size
+                segments.append(_LayoutSegment(start, pos, "data", None, source, layout_entry))
+                append_static(
+                    "data_descriptor",
+                    entry.DataDescriptor(uses_zip64),
+                    layout_entry,
+                    source
+                )
+
+        central_directory_offset = pos
+        for entry, _ in entry_layouts:
+            append_static(
+                "central_directory_header",
+                entry._central_directory_header_data(),
+                entry
+            )
+        central_directory_size = pos - central_directory_offset
+        central_directory_count = len(self._entries)
+
+        if (
+            central_directory_count >= ZIP_FILECOUNT_LIMIT or
+            central_directory_offset > ZIP64_LIMIT or
+            central_directory_size > ZIP64_LIMIT
+        ):
+            zip64_end_start = pos
+            zip64_end = struct.pack(
+                structEndArchive64,
+                stringEndArchive64,
+                44,
+                ZIP64_VERSION,
+                ZIP64_VERSION,
+                0,
+                0,
+                central_directory_count,
+                central_directory_count,
+                central_directory_size,
+                central_directory_offset,
+            )
+            zip64_locator = struct.pack(
+                structEndArchive64Locator,
+                stringEndArchive64Locator,
+                0,
+                zip64_end_start,
+                1,
+            )
+            append_static("zip64_end_of_central_directory", zip64_end + zip64_locator)
+
+            central_directory_count = min(central_directory_count, 0xFFFF)
+            central_directory_size = min(central_directory_size, 0xFFFFFFFF)
+            central_directory_offset = min(central_directory_offset, 0xFFFFFFFF)
+
+        end_record = struct.pack(
+            structEndArchive,
+            stringEndArchive,
+            0,
+            0,
+            central_directory_count,
+            central_directory_count,
+            central_directory_size,
+            central_directory_offset,
+            len(self._comment)
+        )
+        append_static("end_of_central_directory", end_record)
+        append_static("comment", self._comment)
+
+        self._segments = tuple(segments)
+        self._segment_starts = tuple(segment.start for segment in self._segments)
+        self._size = pos
+        self._final = True
+        return self
+
+    def __len__(self):
+        return self.size
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if not self._final:
+            raise RuntimeError("SeekableZipStream has not been finalized")
+        if whence == os.SEEK_SET:
+            pos = offset
+        elif whence == os.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            pos = self._size + offset
+        else:
+            raise ValueError("unsupported seek whence value")
+        if not 0 <= pos <= self._size:
+            raise ValueError("seek position is outside of the archive")
+        self._pos = pos
+        return self._pos
+
+    def iter_range(self, start, end, chunk_size=READ_BUFFER):
+        """Yield bytes for the half-open range [start, end)"""
+        if not self._final:
+            raise RuntimeError("SeekableZipStream has not been finalized")
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise TypeError("range bounds must be integers")
+        if not 0 <= start <= end <= self._size:
+            raise ValueError("range is outside of the archive")
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        if start == end:
+            return
+
+        index = bisect.bisect_right(self._segment_starts, start) - 1
+        while start < end:
+            segment = self._segments[index]
+            part_end = min(end, segment.end)
+            if segment.kind == "data":
+                for buf in segment.source.iter_range(
+                    start - segment.start,
+                    part_end - segment.start,
+                    chunk_size
+                ):
+                    yield buf
+            else:
+                yield segment.data[start - segment.start:part_end - segment.start]
+            start = part_end
+            index += 1
+
+    def read_range(self, start, end):
+        """Return bytes for the half-open range [start, end)"""
+        return b"".join(self.iter_range(start, end))
+
+    def read(self, size=-1):
+        with self._read_lock:
+            if size is None or size < 0:
+                end = self._size
+            else:
+                end = min(self._size, self._pos + size)
+            data = self.read_range(self._pos, end)
+            self._pos = end
+            return data
 
 
 def _validate_final(func):
