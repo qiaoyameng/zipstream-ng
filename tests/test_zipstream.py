@@ -9,7 +9,9 @@ import logging
 import ntpath
 import os
 import random
+import struct
 import sys
+import tempfile
 import time
 import zipfile
 import zlib
@@ -110,6 +112,25 @@ def _assert_equal_zips(z1, z2):
 def _gen_rand():
     for x in range(10):
         yield _randbytes(1024)
+
+
+def _build_small_member_zip(monkeypatch, spool_size):
+    faketime = (1980, 1, 1, 0, 0, 0)
+    monkeypatch.setattr(time, "localtime", lambda _=None: faketime)
+    monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 300)
+    monkeypatch.setattr(zipstream.ng, "ZIP_FILECOUNT_LIMIT", 300)
+
+    zs = ZipStream(central_directory_spool_size=spool_size)
+    zs.comment = "归档注释"
+    for i in range(301):
+        if i == 17:
+            arcname = "目录/"
+            zs.mkdir(arcname)
+        else:
+            arcname = "文件-{:03d}".format(i) if i % 7 == 0 else "file-{:03d}".format(i)
+            zs.add("data-{:03d}".format(i).encode("ascii"), arcname)
+
+    return zs, b"".join(zs)
 
 
 ################################
@@ -299,6 +320,147 @@ def test_footer_partial(files):
     assert len(zf.infolist()) == 1
 
     _verify_zip_contains(zf, files[0])
+
+
+def test_central_directory_spool_matches_memory(monkeypatch):
+    """Spooled central directories replay in order with identical ZIP records"""
+    memory_zs, memory_data = _build_small_member_zip(monkeypatch, None)
+    spooled_zs, spooled_data = _build_small_member_zip(monkeypatch, 1)
+
+    assert memory_data == spooled_data
+
+    memory_zf = _get_zip(memory_data)
+    spooled_zf = _get_zip(spooled_data)
+
+    assert memory_zf.comment == spooled_zf.comment == "归档注释".encode("utf-8")
+    assert [x.filename for x in memory_zf.infolist()] == \
+        [x.filename for x in spooled_zf.infolist()]
+    assert len(spooled_zf.infolist()) == 301
+    assert spooled_zf.infolist()[0].filename == "文件-000"
+    assert spooled_zf.infolist()[7].filename == "文件-007"
+    assert spooled_zf.infolist()[17].is_dir()
+
+    for info in spooled_zf.infolist():
+        if not info.is_dir():
+            index = int(info.filename.rsplit("-", 1)[1])
+            assert spooled_zf.read(info) == "data-{:03d}".format(index).encode("ascii")
+
+    locator_offset = spooled_data.rfind(b"PK\x06\x07")
+    _, _, zip64_offset, _ = struct.unpack(
+        "<4sLQL", spooled_data[locator_offset:locator_offset + 20]
+    )
+    (_, _, _, _, _, _, count, _, central_size,
+     central_offset) = struct.unpack(
+        "<4sQHHIIQQQQ", spooled_data[zip64_offset:zip64_offset + 56]
+    )
+    assert count == 301
+    assert spooled_data[central_offset:central_offset + central_size] == \
+        memory_data[central_offset:central_offset + central_size]
+    assert memory_zs._central_directory is None
+    assert spooled_zs._central_directory is None
+
+
+def test_central_directory_spool_info_does_not_replay():
+    """Counts and queued info stay available without replaying metadata"""
+    zs = ZipStream(central_directory_spool_size=1)
+    zs.add(b"queued", "queued.txt")
+
+    assert zs.num_streamed() == 0
+    assert [x["name"] for x in zs.info_list()] == ["queued.txt"]
+
+    b"".join(zs.file())
+    assert zs.num_streamed() == 1
+
+    central_directory = zs._central_directory
+    original_seek = central_directory.seek
+    original_read = central_directory.read
+    central_directory.seek = lambda *args: pytest.fail("central directory was replayed")
+    central_directory.read = lambda *args: pytest.fail("central directory was replayed")
+
+    assert zs.info_list() == []
+    with pytest.warns(DeprecationWarning, match="ZipStream.info_list"):
+        with pytest.raises(RuntimeError, match="get_info is unavailable"):
+            zs.get_info()
+
+    zs.add(b"later", "later.txt")
+    assert [x["name"] for x in zs.info_list()] == ["later.txt"]
+    assert zs.num_streamed() == 1
+    central_directory.seek = original_seek
+    central_directory.read = original_read
+    b"".join(zs.footer())
+
+
+def test_central_directory_spool_invalid_arguments():
+    with pytest.raises(TypeError, match="integer or None"):
+        ZipStream(central_directory_spool_size="1")
+    with pytest.raises(ValueError, match=">= 0"):
+        ZipStream(central_directory_spool_size=-1)
+
+
+def test_central_directory_spool_cleanup(monkeypatch):
+    """Temporary streams are released on success, source failure, and close"""
+    rolled_paths = []
+
+    class TrackedSpooledTemporaryFile(tempfile.SpooledTemporaryFile):
+        def rollover(self):
+            if not rolled_paths or rolled_paths[-1] != self.name:
+                super().rollover()
+                rolled_paths.append(self.name)
+
+    monkeypatch.setattr(
+        zipstream.ng.tempfile,
+        "SpooledTemporaryFile",
+        TrackedSpooledTemporaryFile
+    )
+
+    zs = ZipStream(central_directory_spool_size=1)
+    zs.add(b"a", "a")
+    b"".join(zs)
+    assert rolled_paths
+    assert zs._central_directory is None
+    assert not os.path.exists(rolled_paths.pop())
+
+    def bad_source():
+        yield b"b"
+        raise RuntimeError("source failed")
+
+    zs = ZipStream(central_directory_spool_size=1)
+    zs.add(b"a", "a")
+    b"".join(zs.file())
+    zs.add(iter(bad_source()), "bad")
+    with pytest.raises(RuntimeError, match="source failed"):
+        b"".join(zs.file())
+    assert zs._central_directory is None
+    assert zs._final
+    assert not os.path.exists(rolled_paths.pop())
+
+    zs = ZipStream(central_directory_spool_size=1)
+    zs.add(b"a", "a")
+    zs.add(b"b", "b")
+    b"".join(zs.file())
+    zs.add(b"b", "b")
+    zs.close()
+    assert zs._central_directory is None
+    assert zs._final
+    assert not os.path.exists(rolled_paths.pop())
+
+    zs = ZipStream(central_directory_spool_size=1)
+    zs.add(b"a", "a")
+    zs.add(b"b", "b")
+    generator = zs.all_files()
+    next(generator)
+    generator.close()
+    assert zs._central_directory is None
+    assert zs._final
+
+    zs = ZipStream(central_directory_spool_size=1)
+    zs.add(b"a", "a")
+    b"".join(zs.all_files())
+    generator = zs.footer()
+    next(generator)
+    generator.close()
+    assert zs._central_directory is None
+    assert not os.path.exists(rolled_paths.pop())
 
 
 @pytest.mark.skipif(not PY36, reason="Tests error handling when compress_level is unavailable (Python <3.7 only)")

@@ -11,6 +11,7 @@ import os
 import stat
 import struct
 import sys
+import tempfile
 import time
 import threading
 import warnings
@@ -533,10 +534,11 @@ class ZipStream:
     iterated over.
 
     Ideal for situations where a zip file needs to be dynamically generated
-    without using temporary files (ie: web applications).
+    without requiring temporary files by default (ie: web applications).
     """
 
-    def __init__(self, *, compress_type=ZIP_STORED, compress_level=None, sized=False):
+    def __init__(self, *, compress_type=ZIP_STORED, compress_level=None, sized=False,
+                 central_directory_spool_size=None):
         """Create a ZipStream
 
         compress_type:
@@ -576,11 +578,33 @@ class ZipStream:
             If `False` (the default), no restrictions are enforced and using the
             object with the `len()` function will not work (will raise a
             TypeError)
+
+        central_directory_spool_size:
+            The maximum number of central-directory bytes to keep in memory.
+            When this threshold is exceeded, the central-directory records are
+            transparently moved to a temporary file owned by this ZipStream and
+            replayed in their original order when the archive footer is
+            generated. The temporary file is closed when the stream finishes,
+            fails, or is closed early. If `None` (the default), all
+            central-directory metadata is kept in memory.
+
+            In spooling mode, detailed information for entries that have already
+            been streamed is not retained in memory. `.info_list()` therefore
+            only returns information for queued entries and `.num_streamed()`
+            can be used for the streamed count. `.get_info()` is unavailable in
+            this mode because it only reports streamed entries.
         """
         if compress_type and sized:
             raise ValueError("Cannot use compression with a sized ZipStream")
 
         _check_compression(compress_type, compress_level)
+
+        if central_directory_spool_size is not None:
+            if isinstance(central_directory_spool_size, bool) or \
+                    not isinstance(central_directory_spool_size, int):
+                raise TypeError("central_directory_spool_size must be an integer or None")
+            if central_directory_spool_size < 0:
+                raise ValueError("central_directory_spool_size must be >= 0")
 
         self._compress_type = compress_type
         self._compress_level = compress_level
@@ -596,10 +620,22 @@ class ZipStream:
         self._size_prog = (0, 0, 0)
         self._size_lock = threading.Lock()
 
+        self._central_directory_spool_size = central_directory_spool_size
+        self._central_directory = None
+        self._central_directory_size = 0
+        self._streamed_count = 0
+        if central_directory_spool_size is not None:
+            self._central_directory = tempfile.SpooledTemporaryFile(
+                max_size=central_directory_spool_size
+            )
+
         # For generating
         self._gen_lock = threading.Lock()
         self._pos = 0
         self._final = False
+
+    def __del__(self):
+        self._close_central_directory()
 
     def __iter__(self):
         """Generate zipped data from the added files/data"""
@@ -657,8 +693,12 @@ class ZipStream:
         # generated, calling this function again without exhausting the generator
         # first will cause corrupted streams. Prevent this by adding a lock
         # around the functions that actually generate data.
-        with self._gen_lock:
-            yield from self._gen_file_entry(**kwargs)
+        try:
+            with self._gen_lock:
+                yield from self._gen_file_entry(**kwargs)
+        except BaseException:
+            self._abort()
+            raise
         return True
 
     def all_files(self):
@@ -676,6 +716,11 @@ class ZipStream:
             if self._final:
                 return
             yield from self._gen_archive_footer()
+
+    def close(self):
+        """Release resources owned by the ZipStream"""
+        with self._gen_lock:
+            self._abort()
 
     def finalize(self):
         """Finish generating the zip stream and finalize it.
@@ -902,7 +947,7 @@ class ZipStream:
 
     def is_empty(self):
         """Check if any files have been added to the ZipStream"""
-        return not self._queue and not self._filelist
+        return not self._queue and self._streamed_count == 0
 
     def num_queued(self):
         """The number of files queued up to be added to the stream"""
@@ -910,7 +955,7 @@ class ZipStream:
 
     def num_streamed(self):
         """The number of files that have already been added to the stream"""
-        return len(self._filelist)
+        return self._streamed_count
 
     def info_list(self):
         """Get a list of dicts containing data about each file in the ZipStream
@@ -918,29 +963,38 @@ class ZipStream:
         File information will be yielded in the order that the files were
         added.
 
-        All files will be included in this list. The "streamed" key indicates
-        if the file has been written to the ZipStream or not. Files that
-        haven't yet been written to the ZipStream will be missing information
-        that's only known post-write (compressed size, CRC, datetime, etc.)
+        All files will be included in this list unless central-directory
+        spooling is enabled. In that mode, only queued files are returned
+        because streamed-file metadata has been moved to the temporary stream
+        and is not read back into memory by this method. Use
+        `.num_streamed()` to get the number of streamed files in that mode.
+
+        The "streamed" key indicates if the file has been written to the
+        ZipStream or not. Files that haven't yet been written to the ZipStream
+        will be missing information that's only known post-write (compressed
+        size, CRC, datetime, etc.)
         """
         # Need to prevent another thread from popping a result from
         # self._queue, then this function being run before it can be added to
         # self._filelist
         with self._gen_lock:
-            info = [
-                {
-                    "name": x.filename,
-                    "size": x.file_size,
-                    "compressed_size": x.compress_size,
-                    "datetime": x.date_time,
-                    "is_dir": x.is_dir(),
-                    "CRC": x.CRC,
-                    "compress_type": x.compress_type,
-                    "compress_level": getattr(x, "_compresslevel", None),  # <3.7 compat
-                    "streamed": True,
-                }
-                for x in self._filelist
-            ]
+            if self._central_directory_spool_size is None:
+                info = [
+                    {
+                        "name": x.filename,
+                        "size": x.file_size,
+                        "compressed_size": x.compress_size,
+                        "datetime": x.date_time,
+                        "is_dir": x.is_dir(),
+                        "CRC": x.CRC,
+                        "compress_type": x.compress_type,
+                        "compress_level": getattr(x, "_compresslevel", None),  # <3.7 compat
+                        "streamed": True,
+                    }
+                    for x in self._filelist
+                ]
+            else:
+                info = []
             for x in self._queue:
                 is_dir = x["arcname"][-1] == "/"
                 compress_type = x.get("compress_type", self._compress_type)
@@ -977,6 +1031,13 @@ class ZipStream:
             "version. Use ZipStream.info_list instead",
             DeprecationWarning,
         )
+        if self._central_directory_spool_size is not None:
+            raise RuntimeError(
+                "get_info is unavailable when central_directory_spool_size is "
+                "set; streamed metadata is not retained in memory. Use "
+                "num_streamed for a count, or disable spooling for detailed "
+                "entry information"
+            )
         return [
             {
                 "name": x.filename,
@@ -992,7 +1053,8 @@ class ZipStream:
         ]
 
     @classmethod
-    def from_path(cls, path, *, compress_type=ZIP_STORED, compress_level=None, sized=None, **kwargs):
+    def from_path(cls, path, *, compress_type=ZIP_STORED, compress_level=None,
+                  sized=None, central_directory_spool_size=None, **kwargs):
         """Convenience method that creates a ZipStream and adds the contents of
         a path to it.
 
@@ -1010,10 +1072,23 @@ class ZipStream:
         z = cls(
             compress_type=compress_type,
             compress_level=compress_level,
-            sized=sized
+            sized=sized,
+            central_directory_spool_size=central_directory_spool_size
         )
         z.add_path(path, **kwargs)
         return z
+
+    def _abort(self):
+        """Mark generation as finished and release owned temporary streams"""
+        self._final = True
+        self._close_central_directory()
+
+    def _close_central_directory(self):
+        """Close and discard the central-directory temporary stream"""
+        central_directory = getattr(self, "_central_directory", None)
+        if central_directory is not None:
+            self._central_directory = None
+            central_directory.close()
 
     def _enqueue(self, **kwargs):
         """Internal method to enqueue files, data, and iterables to be streamed"""
@@ -1157,7 +1232,13 @@ class ZipStream:
                     "actual size did not match the computed size".format(arcname)
                 )
 
-        self._filelist.append(zinfo)
+        central_directory_data = zinfo._central_directory_header_data()
+        if self._central_directory is not None:
+            self._central_directory.write(central_directory_data)
+            self._central_directory_size += len(central_directory_data)
+        else:
+            self._filelist.append(zinfo)
+        self._streamed_count += 1
 
     def _gen_archive_footer(self):
         """Yield data for the end of central directory record"""
@@ -1166,59 +1247,72 @@ class ZipStream:
         # Mark the ZipStream as finalized so no other data can be added to it
         self._final = True
 
-        # Write central directory file headers
-        centDirOffset = self._pos
-        for zinfo in self._filelist:
-            yield self._track(zinfo._central_directory_header_data())
+        try:
+            # Write central directory file headers
+            centDirOffset = self._pos
+            if self._central_directory is not None:
+                self._central_directory.seek(0)
+                while True:
+                    central_directory_data = self._central_directory.read(READ_BUFFER)
+                    if not central_directory_data:
+                        break
+                    yield self._track(central_directory_data)
+                centDirCount = self._streamed_count
+                centDirSize = self._central_directory_size
+            else:
+                for zinfo in self._filelist:
+                    yield self._track(zinfo._central_directory_header_data())
+                centDirCount = len(self._filelist)
+                centDirSize = self._pos - centDirOffset
 
-        # Write end of central directory record
-        zip64EndRecStart = self._pos
-        centDirCount = len(self._filelist)
-        centDirSize = zip64EndRecStart - centDirOffset
-        if (centDirCount >= ZIP_FILECOUNT_LIMIT or
-            centDirOffset > ZIP64_LIMIT or
-            centDirSize > ZIP64_LIMIT
-        ):
-            # Need to also write a Zip64 end-of-archive record
-            zip64EndRec = struct.pack(
-                structEndArchive64,
-                stringEndArchive64,
-                44,  # size of this record after this point
-                     # (note: no "zip extensible data" is added so this is a constant)
-                ZIP64_VERSION,  # version made by
-                ZIP64_VERSION,  # version needed to extract
+            # Write end of central directory record
+            zip64EndRecStart = self._pos
+            if (centDirCount >= ZIP_FILECOUNT_LIMIT or
+                centDirOffset > ZIP64_LIMIT or
+                centDirSize > ZIP64_LIMIT
+            ):
+                # Need to also write a Zip64 end-of-archive record
+                zip64EndRec = struct.pack(
+                    structEndArchive64,
+                    stringEndArchive64,
+                    44,  # size of this record after this point
+                         # (note: no "zip extensible data" is added so this is a constant)
+                    ZIP64_VERSION,  # version made by
+                    ZIP64_VERSION,  # version needed to extract
+                    0,  # disk number this record is on
+                    0,  # disk number that contains the start of the central directory
+                    centDirCount,
+                    centDirCount,
+                    centDirSize,
+                    centDirOffset,
+                )
+                zip64LocRec = struct.pack(
+                    structEndArchive64Locator,
+                    stringEndArchive64Locator,
+                    0,  # disk number where the zip64EndRec starts
+                    zip64EndRecStart,
+                    1,  # total number of disks
+                )
+                yield self._track(zip64EndRec + zip64LocRec)
+
+                centDirCount = min(centDirCount, 0xFFFF)
+                centDirSize = min(centDirSize, 0xFFFFFFFF)
+                centDirOffset = min(centDirOffset, 0xFFFFFFFF)
+
+            endRec = struct.pack(
+                structEndArchive,
+                stringEndArchive,
                 0,  # disk number this record is on
                 0,  # disk number that contains the start of the central directory
                 centDirCount,
                 centDirCount,
                 centDirSize,
                 centDirOffset,
+                len(self._comment)
             )
-            zip64LocRec = struct.pack(
-                structEndArchive64Locator,
-                stringEndArchive64Locator,
-                0,  # disk number where the zip64EndRec starts
-                zip64EndRecStart,
-                1,  # total number of disks
-            )
-            yield self._track(zip64EndRec + zip64LocRec)
-
-            centDirCount = min(centDirCount, 0xFFFF)
-            centDirSize = min(centDirSize, 0xFFFFFFFF)
-            centDirOffset = min(centDirOffset, 0xFFFFFFFF)
-
-        endRec = struct.pack(
-            structEndArchive,
-            stringEndArchive,
-            0,  # disk number this record is on
-            0,  # disk number that contains the start of the central directory
-            centDirCount,
-            centDirCount,
-            centDirSize,
-            centDirOffset,
-            len(self._comment)
-        )
-        yield self._track(endRec + self._comment)
+            yield self._track(endRec + self._comment)
+        finally:
+            self._close_central_directory()
 
     def _add_size_from_file(self, arcname, size):
         """Add the file to the calculated size of the ZipStream"""

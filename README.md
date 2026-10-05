@@ -21,6 +21,7 @@ calculate the final size of the zip file before streaming it.
  - Threadsafe: Won't mangle data if multiple threads concurrently add data to the same stream.
  - Includes a clone of Python's `http.server` module with zip support added. Try `python -m zipstream.server`.
  - Automatically uses Zip64 extensions, but only if they are required.
+ - Can optionally spool central-directory metadata to a temporary file when exporting many small members.
  - No external dependencies.
 
 
@@ -60,6 +61,23 @@ zs = ZipStream.from_path("/path/to/files/")
 with open("files.zip", "wb") as f:
     f.writelines(zs)
 ```
+
+
+### Spool central-directory metadata
+
+The zip file data is always streamed, but the ZIP format requires central-directory records to be
+written after all member data. By default those records are retained in memory. For exports with
+many small members, set `central_directory_spool_size` to keep at most that many bytes of
+central-directory data in memory; larger exports transparently use a temporary file:
+
+```python
+zs = ZipStream(central_directory_spool_size=1024 * 1024)
+```
+
+The temporary file is closed after normal finalization, if a source iterator fails, or when the
+stream or `ZipStream` is closed early. In this mode `num_streamed()` provides the streamed-member
+count without reading metadata back into memory, `info_list()` only describes queued members, and
+the deprecated `get_info()` is unavailable.
 
 
 ### Create a local zip file (demos more of the API)
