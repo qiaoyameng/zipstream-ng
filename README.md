@@ -21,6 +21,7 @@ calculate the final size of the zip file before streaming it.
  - Threadsafe: Won't mangle data if multiple threads concurrently add data to the same stream.
  - Includes a clone of Python's `http.server` module with zip support added. Try `python -m zipstream.server`.
  - Automatically uses Zip64 extensions, but only if they are required.
+ - Can emit explicit raw-DEFLATE restart points plus a versioned side index for ranged reads of large members.
  - No external dependencies.
 
 
@@ -172,8 +173,54 @@ def gen_zipfile():
         ),
         "manifest.json"
     )
-    yield from zs.finalize()
+yield from zs.finalize()
 ```
+
+
+### Segmented DEFLATE ranges
+
+Ordinary DEFLATE data cannot be resumed at an arbitrary middle offset because the decompressor needs the earlier
+dictionary. Set `segmented=True` when using `ZIP_DEFLATED` to insert explicit `Z_FULL_FLUSH` restart points. The
+archive still uses the standard DEFLATE method number, so normal `zipfile` extraction is unchanged.
+
+After the stream is finalized, `.side_index()` returns a version 1 index containing the archive identity, member
+identity, member CRC/sizes, compressed/uncompressed checkpoint offsets, and the exact archive footer range. It can
+be serialized as JSON and stored beside the archive.
+
+```python
+import json
+from zipfile import ZIP_DEFLATED
+from zipstream import ZipStream, read_member_range
+
+zs = ZipStream(
+    compress_type=ZIP_DEFLATED,
+    segmented=True,
+    segment_size=1024 * 1024,
+)
+zs.add(large_iterable, "large.bin", size=large_size)
+archive_bytes = bytes(zs)
+
+with open("large.zip.json", "w", encoding="utf-8") as f:
+    json.dump(zs.side_index(), f)
+
+# The caller owns the ranged byte source (HTTP Range, S3 GetObject, etc.).
+def read_archive_bytes(offset, length):
+    return archive_bytes[offset:offset + length]
+
+result = read_member_range(
+    zs.side_index(), "large.bin",
+    2_500_000, 2_600_000,
+    read_archive_bytes,
+)
+result.data                 # Exactly the requested uncompressed bytes
+result.compressed_range     # Actual archive bytes read for the DEFLATE segment(s)
+result.range_crc32          # CRC32 of only the returned range
+result.member_crc_verified  # Always False for a ranged read; extract fully to verify the member CRC
+```
+
+The reader also reads the small central-directory/EOCD footer recorded in the side index and verifies that the index
+is bound to the presented archive and member. A ranged response only reports checksum state for the bytes returned;
+it does not claim that the complete member CRC was verified.
 
 
 Comparison to stdlib
