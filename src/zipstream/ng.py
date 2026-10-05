@@ -6,6 +6,8 @@ import collections
 import datetime
 import errno
 import functools
+import hashlib
+import json
 import logging
 import os
 import stat
@@ -14,6 +16,17 @@ import sys
 import time
 import threading
 import warnings
+import zlib
+
+from zipstream.segmented import (
+    SIDE_INDEX_VERSION,
+    SideIndexError,
+    get_member,
+    load_side_index,
+    read_member_range,
+    SegmentedRange,
+    verify_archive,
+)
 from zipfile import (
     # Classes
     ZipInfo,
@@ -79,7 +92,14 @@ __all__ = [
     "ZIP_LZMA", "LZMA_VERSION",
     *(["ZIP_ZSTANDARD", "ZSTANDARD_VERSION"] if not PY313_COMPAT else []),
     # Helper functions
-    "walk"
+    "walk",
+    "SIDE_INDEX_VERSION",
+    "SideIndexError",
+    "get_member",
+    "load_side_index",
+    "read_member_range",
+    "SegmentedRange",
+    "verify_archive",
 ]
 
 __log__ = logging.getLogger(__name__)
@@ -116,7 +136,83 @@ def _check_compression(compress_type, compress_level):
                 "compress_level must be between {} and {} when using ZIP_ZSTANDARD".format(
                     *ZSTD_LEVEL_BOUNDS
                 )
-            )
+                )
+
+
+def _check_segment_size(segment_size):
+    """Validate an explicit segmented DEFLATE interval size"""
+    if segment_size is None:
+        return
+    if not isinstance(segment_size, int) or isinstance(segment_size, bool):
+        raise TypeError("segment_size must be an integer or None")
+    if segment_size < 1:
+        raise ValueError("segment_size must be greater than 0")
+
+
+class _SegmentedDeflater:
+    """DEFLATE compressor with dictionary-free recovery checkpoints"""
+
+    def __init__(self, compress_level, segment_size):
+        _check_segment_size(segment_size)
+        self.segment_size = segment_size
+        self.compress_level = compress_level
+        self._cmpr = _get_compressor(ZIP_DEFLATED, compress_level)
+        self.uncompressed_size = 0
+        self.compressed_size = 0
+        self._pending_boundary = False
+        self.checkpoints = [
+            {
+                "compressed_offset": 0,
+                "uncompressed_offset": 0,
+            }
+        ]
+
+    def _compressed(self, data):
+        self.compressed_size += len(data)
+        return data
+
+    def compress(self, data):
+        output = b""
+        if self._pending_boundary:
+            boundary = self._cmpr.flush(zlib.Z_FULL_FLUSH)
+            output += self._compressed(boundary)
+            self.checkpoints.append({
+                "compressed_offset": self.compressed_size,
+                "uncompressed_offset": self.uncompressed_size,
+            })
+            self._pending_boundary = False
+
+        while data:
+            position_in_segment = self.uncompressed_size % self.segment_size
+            limit = self.segment_size - position_in_segment
+            chunk, data = data[:limit], data[limit:]
+
+            output += self._compressed(self._cmpr.compress(chunk))
+            self.uncompressed_size += len(chunk)
+
+            if chunk and self.uncompressed_size % self.segment_size == 0:
+                if data:
+                    boundary = self._cmpr.flush(zlib.Z_FULL_FLUSH)
+                    output += self._compressed(boundary)
+                    self.checkpoints.append({
+                        "compressed_offset": self.compressed_size,
+                        "uncompressed_offset": self.uncompressed_size,
+                    })
+                else:
+                    self._pending_boundary = True
+
+        return output
+
+    def flush(self):
+        if self._pending_boundary:
+            self._pending_boundary = False
+        output = self._compressed(self._cmpr.flush())
+        if self.uncompressed_size:
+            self.checkpoints.append({
+                "compressed_offset": self.compressed_size,
+                "uncompressed_offset": self.uncompressed_size,
+            })
+        return output
 
 
 def _min_version_for_compress_type(compress_type, min_version=0):
@@ -245,7 +341,8 @@ class ZipStreamInfo(ZipInfo):
         )
         return header + filename + extra
 
-    def _file_data(self, iterable=None, force_zip64=False):
+    def _file_data(self, iterable=None, force_zip64=False, segment_size=None,
+                   archive_offset=0):
         """Given an iterable of file data, yield a local file header and file
         data for it.
 
@@ -278,13 +375,27 @@ class ZipStreamInfo(ZipInfo):
         zip64 = force_zip64 or self.file_size * ZIP64_ESTIMATE_FACTOR > ZIP64_LIMIT
 
         # Make header
-        yield self.FileHeader(zip64)
+        local_header = self.FileHeader(zip64)
+        self.local_header_offset = archive_offset
+        self.compressed_data_offset = archive_offset + len(local_header)
+        self.local_header_sha256 = hashlib.sha256(local_header).hexdigest()
+        self.segment_checkpoints = None
+        self.compressed_data_sha256 = None
+        self.segment_size = segment_size
+        yield local_header
 
         # Store/compress the data while keeping track of size and CRC
-        if not PY36_COMPAT:
+        segmented = segment_size is not None
+        if segmented:
+            _check_segment_size(segment_size)
+            if self.compress_type != ZIP_DEFLATED:
+                raise ValueError("segment_size can only be used with ZIP_DEFLATED")
+            cmpr = _SegmentedDeflater(self._compresslevel, segment_size)
+        elif not PY36_COMPAT:
             cmpr = _get_compressor(self.compress_type, self._compresslevel)
         else:
             cmpr = _get_compressor(self.compress_type)
+        data_hasher = hashlib.sha256()
         crc = 0
         file_size = 0
         compress_size = 0
@@ -294,21 +405,35 @@ class ZipStreamInfo(ZipInfo):
             crc = crc32(buf, crc) & 0xFFFFFFFF
             if cmpr:
                 buf = cmpr.compress(buf)
-                compress_size += len(buf)
+                if segmented:
+                    compress_size = cmpr.compressed_size
+                else:
+                    compress_size += len(buf)
+            else:
+                compress_size = file_size
+            if buf:
+                data_hasher.update(buf)
             yield buf
 
         if cmpr:
             buf = cmpr.flush()
             if buf:
-                compress_size += len(buf)
+                if segmented:
+                    compress_size = cmpr.compressed_size
+                else:
+                    compress_size += len(buf)
+                data_hasher.update(buf)
                 yield buf
         else:
             compress_size = file_size
+        if segmented:
+            self.segment_checkpoints = cmpr.checkpoints
 
         # Update the CRC and filesize info
         self.CRC = crc
         self.file_size = file_size
         self.compress_size = compress_size
+        self.compressed_data_sha256 = data_hasher.hexdigest()
 
         if not zip64 and max(file_size, compress_size) > ZIP64_LIMIT:
             # Didn't estimate correctly :(
@@ -440,18 +565,21 @@ def _validate_compression(func):
     """Prevent the wrapped method from using invalid compression options"""
 
     @functools.wraps(func)
-    def wrapper(self, *args, compress_type=None, compress_level=None, **kwargs):
+    def wrapper(self, *args, compress_type=None, compress_level=None,
+                segment_size=None, **kwargs):
         if compress_type is not None or compress_level is not None:
             _check_compression(
                 compress_type if compress_type is not None else self._compress_type,
                 compress_level if compress_level is not None else self._compress_level
             )
+        _check_segment_size(segment_size)
 
         return func(
             self,
             *args,
             compress_type=compress_type,
             compress_level=compress_level,
+            segment_size=segment_size,
             **kwargs
         )
 
@@ -536,7 +664,8 @@ class ZipStream:
     without using temporary files (ie: web applications).
     """
 
-    def __init__(self, *, compress_type=ZIP_STORED, compress_level=None, sized=False):
+    def __init__(self, *, compress_type=ZIP_STORED, compress_level=None,
+                 segment_size=None, sized=False):
         """Create a ZipStream
 
         compress_type:
@@ -563,6 +692,12 @@ class ZipStream:
             Only available in Python 3.7+ (raises a ValueError if used on a
             lower version)
 
+        segment_size:
+            When using ZIP_DEFLATED, insert a dictionary-free recovery
+            checkpoint every segment_size uncompressed bytes. The ZIP entry
+            remains ordinary DEFLATE; checkpoint metadata is available from
+            `.side_index()` after finalization. Must be a positive integer.
+
         sized:
             If `True`, will make the ZipStream able to calculate its final size
             prior to being generated, making it work with the `len()` function.
@@ -581,9 +716,13 @@ class ZipStream:
             raise ValueError("Cannot use compression with a sized ZipStream")
 
         _check_compression(compress_type, compress_level)
+        _check_segment_size(segment_size)
+        if segment_size is not None and compress_type != ZIP_DEFLATED:
+            raise ValueError("segment_size can only be used with ZIP_DEFLATED")
 
         self._compress_type = compress_type
         self._compress_level = compress_level
+        self._segment_size = segment_size
         self._comment = b""
         self._last_modified = None
 
@@ -600,6 +739,8 @@ class ZipStream:
         self._gen_lock = threading.Lock()
         self._pos = 0
         self._final = False
+        self._archive_hasher = hashlib.sha256()
+        self._side_index = None
 
     def __iter__(self):
         """Generate zipped data from the added files/data"""
@@ -689,7 +830,8 @@ class ZipStream:
 
     @_validate_final
     @_validate_compression
-    def add_path(self, path, arcname=None, *, recurse=True, compress_type=None, compress_level=None):
+    def add_path(self, path, arcname=None, *, recurse=True, compress_type=None,
+                 compress_level=None, segment_size=None):
         """Queue up a path to be added to the ZipStream
 
         Queues the `path` up to to be written to the archive, giving it the
@@ -715,8 +857,8 @@ class ZipStream:
         If recurse is `False`, only the specified path (file or directory) will
         be added.
 
-        If given, `compress_type` and `compress_level` override the settings
-        the ZipStream was initialized with.
+        If given, `compress_type`, `compress_level`, and `segment_size`
+        override the settings the ZipStream was initialized with.
 
         Raises a FileNotFoundError if the path does not exist
         Raises a ValueError if an arcname isn't provided and the assumed
@@ -748,7 +890,8 @@ class ZipStream:
                 path=path,
                 arcname=arcname,
                 compress_type=compress_type,
-                compress_level=compress_level
+                compress_level=compress_level,
+                segment_size=segment_size,
             )
             return
 
@@ -765,12 +908,14 @@ class ZipStream:
                 path=filepath,
                 arcname=filearcname,
                 compress_type=compress_type,
-                compress_level=compress_level
+                compress_level=compress_level,
+                segment_size=segment_size,
             )
 
     @_validate_final
     @_validate_compression
-    def add(self, data, arcname, *, size=None, compress_type=None, compress_level=None):
+    def add(self, data, arcname, *, size=None, compress_type=None,
+            compress_level=None, segment_size=None):
         """Queue up data to be added to the ZipStream
 
         `data` can be bytes, a string (encoded to bytes using utf-8), or any
@@ -792,8 +937,9 @@ class ZipStream:
         in memory and iterables will not be iterated over until then. For this
         reason it's a good idea to use `add_path()` wherever possible.
 
-        If given, `compress_type` and `compress_level` override the settings the
-        ZipStream was initialized with.
+        If given, `compress_type`, `compress_level`, and `segment_size`
+        override the settings the ZipStream was initialized with.
+        `segment_size` is only valid when the entry uses ZIP_DEFLATED.
 
         Raises a ValueError if an arcname is not provided or ends with a "/"
         when data is given.
@@ -824,6 +970,7 @@ class ZipStream:
                 arcname=arcname,
                 compress_type=compress_type,
                 compress_level=compress_level,
+                segment_size=segment_size,
             )
         elif hasattr(data, "__iter__"):
             if is_directory:
@@ -835,6 +982,7 @@ class ZipStream:
                 arcname=arcname,
                 compress_type=compress_type,
                 compress_level=compress_level,
+                segment_size=segment_size,
             )
         else:
             raise TypeError(
@@ -991,8 +1139,56 @@ class ZipStream:
             for x in self._filelist
         ]
 
+    def _build_side_index(self):
+        """Build the immutable segmented DEFLATE side index"""
+        members = []
+        for index, zinfo in enumerate(self._filelist):
+            checkpoints = getattr(zinfo, "segment_checkpoints", None)
+            if checkpoints is None:
+                continue
+            members.append({
+                "index": index,
+                "name": zinfo.filename,
+                "local_header_offset": zinfo.local_header_offset,
+                "compressed_data_offset": zinfo.compressed_data_offset,
+                "local_header_sha256": zinfo.local_header_sha256,
+                "compressed_data_sha256": zinfo.compressed_data_sha256,
+                "crc32": zinfo.CRC,
+                "file_size": zinfo.file_size,
+                "compress_size": zinfo.compress_size,
+                "segment_size": zinfo.segment_size,
+                "compress_type": zinfo.compress_type,
+                "checkpoints": [
+                    dict(checkpoint) for checkpoint in checkpoints
+                ],
+            })
+
+        return load_side_index({
+            "version": SIDE_INDEX_VERSION,
+            "archive": {
+                "size": self._pos,
+                "sha256": self._archive_hasher.copy().hexdigest(),
+            },
+            "members": members,
+        })
+
+    def side_index(self):
+        """Return the finalized versioned segmented DEFLATE side index"""
+        if not self._final:
+            raise RuntimeError("Cannot get a side index before finalization")
+        return json.loads(json.dumps(self._side_index, sort_keys=True))
+
+    def side_index_bytes(self):
+        """Return canonical JSON bytes for the segmented DEFLATE side index"""
+        return json.dumps(
+            self.side_index(),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
     @classmethod
-    def from_path(cls, path, *, compress_type=ZIP_STORED, compress_level=None, sized=None, **kwargs):
+    def from_path(cls, path, *, compress_type=ZIP_STORED, compress_level=None,
+                  segment_size=None, sized=None, **kwargs):
         """Convenience method that creates a ZipStream and adds the contents of
         a path to it.
 
@@ -1000,9 +1196,9 @@ class ZipStream:
         otherwise. All other parameter defaults are the same as those in
         `__init__` and `add_path`.
 
-        The `compress_type`, `compress_level`, and `sized` parameters will be
-        passed to `__init__`, all other args and kwargs are passed to
-        `add_path`.
+        The `compress_type`, `compress_level`, `segment_size`, and `sized`
+        parameters will be passed to `__init__`; all other args and kwargs are
+        passed to `add_path`.
         """
         if sized is None:
             sized = compress_type == ZIP_STORED
@@ -1010,6 +1206,7 @@ class ZipStream:
         z = cls(
             compress_type=compress_type,
             compress_level=compress_level,
+            segment_size=segment_size,
             sized=sized
         )
         z.add_path(path, **kwargs)
@@ -1076,19 +1273,36 @@ class ZipStream:
             kwargs.pop("compress_type", None)
         if kwargs.get("compress_level") in (None, self._compress_level):
             kwargs.pop("compress_level", None)
-
         # directories are always stored
         if kwargs["arcname"][-1] == "/":
             kwargs["compress_type"] = ZIP_STORED
+            kwargs["segment_size"] = None
+
+        effective_compress_type = (
+            kwargs.get("compress_type")
+            if kwargs.get("compress_type") is not None
+            else self._compress_type
+        )
+        effective_segment_size = kwargs.get("segment_size")
+        if effective_segment_size is None:
+            effective_segment_size = self._segment_size
+        if effective_segment_size is not None and effective_compress_type != ZIP_DEFLATED:
+            raise ValueError("segment_size can only be used with ZIP_DEFLATED")
+
+        if self._sized and effective_segment_size is not None:
+            raise ValueError("Cannot use compression with a sized ZipStream")
 
         self._queue.append(kwargs)
 
     def _track(self, data):
         """Data passthrough with byte counting"""
         self._pos += len(data)
+        self._archive_hasher.update(data)
         return data
 
-    def _gen_file_entry(self, *, path=None, iterable=None, data=None, size=None, arcname, compress_type=None, compress_level=None):
+    def _gen_file_entry(self, *, path=None, iterable=None, data=None, size=None,
+                        arcname, compress_type=None, compress_level=None,
+                        segment_size=None):
         """Yield the zipped data generated by the specified path/iterator/data"""
         assert bool(path) ^ bool(iterable) ^ bool(data is not None)
         assert not (self._sized and size is None)
@@ -1136,7 +1350,14 @@ class ZipStream:
             iterable = gen()
 
         # Generate the file data
-        for x in zinfo._file_data(iterable, force_zip64=force_zip64):
+        if segment_size is None:
+            segment_size = self._segment_size
+        for x in zinfo._file_data(
+            iterable,
+            force_zip64=force_zip64,
+            segment_size=segment_size,
+            archive_offset=zinfo.header_offset,
+        ):
             yield self._track(x)
 
         if size is not None and size != zinfo.file_size:
@@ -1219,6 +1440,7 @@ class ZipStream:
             len(self._comment)
         )
         yield self._track(endRec + self._comment)
+        self._side_index = self._build_side_index()
 
     def _add_size_from_file(self, arcname, size):
         """Add the file to the calculated size of the ZipStream"""

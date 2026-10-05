@@ -100,6 +100,39 @@ with open("files.zip", "wb") as f:
     f.writelines(zs)
 ```
 
+### Segmented DEFLATE with a side index
+
+Set `segment_size` when using DEFLATE to create dictionary-free recovery checkpoints. The resulting
+entry is still ordinary method-8 DEFLATE and can be extracted completely with the standard
+`zipfile` module. After finalization, a versioned side index records archive and member bindings,
+compressed/uncompressed checkpoint offsets, sizes, CRC-32, and digests.
+
+```python
+from zipfile import ZIP_DEFLATED
+from zipstream import ZipStream, read_member_range
+
+zs = ZipStream(compress_type=ZIP_DEFLATED, segment_size=1024 * 1024)
+zs.add(large_data, "large.bin")
+
+zip_data = b"".join(zs)
+side_index = zs.side_index()
+
+# This source could instead issue an HTTP Range request. It receives absolute
+# offsets in the ZIP archive and must return exactly the requested bytes.
+def read_range(start, end):
+    return zip_data[start:end]
+
+result = read_member_range(side_index, "large.bin", 5_000_000, 5_001_000, read_range)
+result.data                 # Decompressed target interval
+result.compressed_start      # Absolute start of the compressed bytes read
+result.compressed_end        # Absolute end of the compressed bytes read
+result.member_crc_verified   # True only for a complete-member read
+```
+
+`member_crc_verified` is not claimed for partial intervals: a range only proves that the requested
+bytes decoded consistently with the sidecar metadata. The full member ZIP CRC-32 is verified only
+when the whole member is decoded and its complete compressed digest matches the side index.
+
 
 ### zipserver (included)
 

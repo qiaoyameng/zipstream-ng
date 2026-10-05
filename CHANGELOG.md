@@ -1,6 +1,9 @@
 zipstream-ng changelog
 ======================
 
+### Unreleased
+- Add explicit segmented DEFLATE support, a versioned side index, and a minimal range reader
+
 ### [v1.9.3]
 - Fix length calculation when adding extended ascii filenames (only affects Python 3.13.14+, 3.14.6+, 3.15+)
 

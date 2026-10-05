@@ -1766,3 +1766,224 @@ def test_zip64_real(tmpdir):
 
         with zf.open("small.bin", "r") as fp:
             assert smalldata == fp.read()
+
+
+def test_segmented_deflate_side_index_and_ranges():
+    """Segmented DEFLATE is zip-compatible and range-reads use checkpoint data"""
+    data = (b"highly-repetitive-data-" * 23)[:497]
+    segment_size = 64
+    zs = ZipStream(compress_type=zipfile.ZIP_DEFLATED, segment_size=segment_size)
+    zs.add(data, "large/repeating.bin")
+
+    def chunked():
+        for offset in range(0, len(data), 37):
+            yield data[offset:offset + 37]
+
+    zs.add(chunked(), "chunked.bin", size=len(data), segment_size=segment_size)
+
+    archive = b"".join(zs)
+    side_index = zs.side_index()
+
+    assert side_index["version"] == zipstream.SIDE_INDEX_VERSION
+    assert side_index["archive"]["size"] == len(archive)
+    assert zipstream.verify_archive(side_index, archive)
+
+    zf = _get_zip(archive)
+    assert zf.read("large/repeating.bin") == data
+    assert zf.read("chunked.bin") == data
+
+    for member in side_index["members"]:
+        assert member["compress_type"] == zipfile.ZIP_DEFLATED
+        assert member["segment_size"] == segment_size
+        checkpoints = member["checkpoints"]
+        assert checkpoints[0] == {
+            "compressed_offset": 0,
+            "uncompressed_offset": 0,
+        }
+        assert checkpoints[-1]["uncompressed_offset"] == len(data)
+        compressed_offsets = [x["compressed_offset"] for x in checkpoints]
+        uncompressed_offsets = [x["uncompressed_offset"] for x in checkpoints]
+        assert compressed_offsets == sorted(set(compressed_offsets))
+        assert uncompressed_offsets == sorted(set(uncompressed_offsets))
+        assert compressed_offsets[-1] <= member["compress_size"]
+
+        for checkpoint in checkpoints[1:-1]:
+            start = member["compressed_data_offset"] + checkpoint["compressed_offset"]
+            end = member["compressed_data_offset"] + member["compress_size"]
+            decoder = zlib.decompressobj(-15)
+            recovered = decoder.decompress(archive[start:end])
+            expected_offset = checkpoint["uncompressed_offset"]
+            assert recovered == data[expected_offset:]
+
+    requested_ranges = [
+        (0, 1),
+        (0, 64),
+        (1, 63),
+        (63, 65),
+        (128, 384),
+        (256, 497),
+        (0, 497),
+    ]
+
+    for member_index, name in (
+        (0, "large/repeating.bin"),
+        (1, "chunked.bin"),
+    ):
+        member = zipstream.get_member(side_index, member_index)
+        assert member["name"] == name
+
+        for start, end in requested_ranges:
+            reads = []
+
+            def read_range(read_start, read_end):
+                reads.append((read_start, read_end))
+                return archive[read_start:read_end]
+
+            result = zipstream.read_member_range(
+                side_index,
+                name,
+                start,
+                end,
+                read_range,
+            )
+
+            assert result.data == data[start:end]
+            assert result.range_crc32 == (zlib.crc32(data[start:end]) & 0xFFFFFFFF)
+            assert result.member_identity_verified
+            assert result.member_crc_verified == ((start, end) == (0, len(data)))
+
+            compressed_start = (
+                member["compressed_data_offset"]
+                + result.compressed_start - member["compressed_data_offset"]
+            )
+            assert compressed_start == result.compressed_start
+            assert reads == [(
+                member["local_header_offset"],
+                member["compressed_data_offset"],
+            ), (
+                result.compressed_start,
+                result.compressed_end,
+            )]
+            assert result.compressed_start < result.compressed_end or start == end
+            assert result.compressed_end <= (
+                member["compressed_data_offset"] + member["compress_size"]
+            )
+            if (start, end) == (0, 64):
+                expected_end = member["compressed_data_offset"] + (
+                    member["checkpoints"][1]["compressed_offset"]
+                )
+                assert result.compressed_end == expected_end
+
+
+def test_segmented_deflate_empty_member_and_invalid_index():
+    """Empty members and corrupt indexes are handled explicitly"""
+    zs = ZipStream(compress_type=zipfile.ZIP_DEFLATED, segment_size=16)
+    zs.add(b"", "empty.bin")
+    archive = b"".join(zs)
+    side_index = zs.side_index()
+
+    assert _get_zip(archive).read("empty.bin") == b""
+    member = side_index["members"][0]
+
+    reads = []
+
+    def read_range(start, end):
+        reads.append((start, end))
+        return archive[start:end]
+
+    result = zipstream.read_member_range(side_index, "empty.bin", 0, 0, read_range)
+    assert result.data == b""
+    assert result.range_crc32 == 0
+    assert result.member_crc_verified
+    assert result.member_identity_verified
+    assert result.compressed_start == member["compressed_data_offset"]
+    assert result.compressed_end == (
+        member["compressed_data_offset"] + member["compress_size"]
+    )
+
+    bad_index = json.loads(json.dumps(side_index))
+    bad_index["archive"]["size"] += 1
+    assert not zipstream.verify_archive(bad_index, archive)
+
+    bad_index = json.loads(json.dumps(side_index))
+    bad_index["members"][0]["checkpoints"][0]["compressed_offset"] = -1
+    with pytest.raises(zipstream.SideIndexError):
+        zipstream.load_side_index(bad_index)
+
+    bad_index = json.loads(json.dumps(side_index))
+    bad_index["members"][0]["checkpoints"][0]["compressed_offset"] = 1
+    with pytest.raises(zipstream.SideIndexError):
+        zipstream.load_side_index(bad_index)
+
+    bad_index = json.loads(json.dumps(side_index))
+    bad_index["members"][0]["compressed_data_offset"] = bad_index["archive"]["size"] + 1
+    with pytest.raises(zipstream.SideIndexError):
+        zipstream.load_side_index(bad_index)
+
+
+def test_segmented_deflate_per_member_override():
+    """Segmented DEFLATE can be selected for one member only"""
+    zs = ZipStream()
+    zs.add(b"stored", "stored.bin")
+    zs.add(b"compressed" * 20, "segmented.bin",
+           compress_type=zipfile.ZIP_DEFLATED, segment_size=16)
+
+    archive = b"".join(zs)
+    zf = _get_zip(archive)
+    assert zf.read("stored.bin") == b"stored"
+    assert zf.read("segmented.bin") == b"compressed" * 20
+
+    side_index = zs.side_index()
+    assert [x["name"] for x in side_index["members"]] == ["segmented.bin"]
+    assert zipstream.get_member(side_index, "segmented.bin")["index"] == 1
+
+
+def test_segmented_deflate_partial_range_does_not_claim_member_crc():
+    """The helper distinguishes range decompression from full member validation"""
+    data = b"repeating-" * 30
+    zs = ZipStream(compress_type=zipfile.ZIP_DEFLATED, segment_size=20)
+    zs.add(data, "x.bin")
+    archive = b"".join(zs)
+    side_index = zs.side_index()
+    member = side_index["members"][0]
+
+    def source(data):
+        def read_range(start, end):
+            return data[start:end]
+        return read_range
+
+    partial = zipstream.read_member_range(
+        side_index, "x.bin", 5, 25, source(archive), verify_identity=False
+    )
+    assert partial.data == data[5:25]
+    assert not partial.member_crc_verified
+    assert not partial.member_identity_verified
+
+    tampered = bytearray(archive)
+    offset = member["compressed_data_offset"] + 5
+    tampered[offset] ^= 0x01
+    with pytest.raises(zipstream.SideIndexError):
+        zipstream.read_member_range(
+            side_index,
+            "x.bin",
+            0,
+            len(data),
+            source(bytes(tampered)),
+            verify_identity=False,
+        )
+
+
+def test_segmented_deflate_requires_deflate():
+    """The explicit segment option cannot silently use another compression type"""
+    with pytest.raises(ValueError):
+        ZipStream(compress_type=zipfile.ZIP_STORED, segment_size=16)
+
+    zs = ZipStream(compress_type=zipfile.ZIP_STORED)
+    with pytest.raises(ValueError):
+        zs.add(b"data", "stored.bin", segment_size=16)
+
+    zs = ZipStream(compress_type=zipfile.ZIP_DEFLATED)
+    with pytest.raises(TypeError):
+        zs.add(b"data", "bad.bin", segment_size=True)
+    with pytest.raises(ValueError):
+        zs.add(b"data", "bad.bin", segment_size=0)
