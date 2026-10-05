@@ -101,6 +101,38 @@ with open("files.zip", "wb") as f:
 ```
 
 
+### Add data that is already compressed
+
+Use `add_compressed` to copy raw DEFLATE data into an archive without decompressing and recompressing
+it. This is useful when an object store already contains raw `ZIP_DEFLATED` data along with the
+original size, compressed size, and CRC32. Only raw DEFLATE streams are accepted - zlib (`wbits=15`)
+and gzip (`wbits=31`) wrappers are not.
+
+By default, the stream is decompressed as it is copied to verify the DEFLATE payload, uncompressed
+length, and CRC32. Pass `verify=False` to skip this work and trust the caller-provided length and
+CRC metadata. Obvious zlib/gzip wrappers are still rejected, and the actual number of compressed
+bytes received is always checked against `compressed_size`.
+
+```python
+import zlib
+from zipstream import ZipStream, ZIP_DEFLATED
+
+raw = b"..."  # Raw DEFLATE chunks, created with wbits=-15
+original = b"..."
+
+zs = ZipStream()
+zs.add_compressed(
+    compressed=iter([raw]),
+    arcname="data.txt",
+    original_size=len(original),
+    compressed_size=len(raw),
+    crc32=zlib.crc32(original) & 0xFFFFFFFF,
+    compress_type=ZIP_DEFLATED,
+    verify=True,
+)
+```
+
+
 ### zipserver (included)
 
 A fully-functional and useful example can be found in the included

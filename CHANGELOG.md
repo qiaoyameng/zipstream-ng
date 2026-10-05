@@ -1,6 +1,10 @@
 zipstream-ng changelog
 ======================
 
+### Unreleased
+- Add `ZipStream.add_compressed` for adding raw DEFLATE data with caller-provided size, compressed
+  size, and CRC32 without recompressing it
+
 ### [v1.9.3]
 - Fix length calculation when adding extended ascii filenames (only affects Python 3.13.14+, 3.14.6+, 3.15+)
 

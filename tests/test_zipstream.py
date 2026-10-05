@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import datetime
+import gzip
 import hashlib
 import io
 import itertools
@@ -9,6 +10,7 @@ import logging
 import ntpath
 import os
 import random
+import struct
 import sys
 import time
 import zipfile
@@ -112,6 +114,42 @@ def _gen_rand():
         yield _randbytes(1024)
 
 
+def _raw_deflate(data):
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+    return compressor.compress(data) + compressor.flush()
+
+
+def _chunks(data, size=4):
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
+
+
+def _assert_no_footer(data):
+    assert b"PK\x05\x06" not in data
+
+
+def _assert_footer_refused(zs):
+    with pytest.raises(RuntimeError, match="failed entry"):
+        list(zs.footer())
+
+
+def _central_header(data, filename):
+    offset = data.find(b"PK\x01\x02")
+    while offset != -1:
+        header = struct.unpack_from("<4s4B4HL2L5H2L", data, offset)
+        filename_length = header[12]
+        extra_length = header[13]
+        comment_length = header[14]
+        name = data[offset + 46:offset + 46 + filename_length]
+        if name == filename.encode("ascii"):
+            return data[offset:offset + 46 + filename_length + extra_length]
+        offset = data.find(
+            b"PK\x01\x02",
+            offset + 46 + filename_length + extra_length + comment_length,
+        )
+    raise AssertionError("Central directory header not found")
+
+
 ################################
 # Tests start
 ################################
@@ -137,6 +175,291 @@ def test_zipstream_compression(caplog, files, ct):
 
     for f in files:
         _verify_zip_contains(zf, f)
+
+
+@pytest.mark.parametrize("verify", [True, False])
+@pytest.mark.parametrize("sized", [False, True])
+def test_add_compressed_between_regular_files(tmp_path, caplog, verify, sized):
+    caplog.set_level(logging.WARNING)
+    plain = (b"precompressed data " * 100)
+    compressed = _raw_deflate(plain)
+    expected_crc = zlib.crc32(plain) & 0xFFFFFFFF
+
+    zs = ZipStream(sized=sized)
+    zs.add(b"before", "before.txt")
+    zs.add_compressed(
+        _chunks(compressed),
+        "precompressed.bin",
+        len(plain),
+        len(compressed),
+        expected_crc,
+        verify=verify,
+    )
+    zs.add(b"after", "after/after.txt")
+
+    info = zs.info_list()[1]
+    assert info["name"] == "precompressed.bin"
+    assert info["size"] == len(plain)
+    assert info["compressed_size"] == len(compressed)
+    assert info["CRC"] == expected_crc
+    assert info["compress_type"] == zipfile.ZIP_DEFLATED
+    assert info["compress_level"] is None
+
+    expected_size = len(zs) if sized else None
+
+    data = bytes(zs)
+    if sized:
+        assert expected_size == len(data)
+    if verify:
+        assert "without integrity verification" not in caplog.text
+    else:
+        assert "trusting caller-provided raw DEFLATE data" in caplog.text
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert zf.testzip() is None
+        infos = {x.filename: x for x in zf.infolist()}
+        info = infos["precompressed.bin"]
+        assert info.compress_type == zipfile.ZIP_DEFLATED
+        assert info.file_size == len(plain)
+        assert info.compress_size == len(compressed)
+        assert info.CRC == expected_crc
+
+        descriptor_offset = info.header_offset + 30 + len(info.filename) + len(compressed)
+        signature, descriptor_crc, descriptor_compressed_size, descriptor_original_size = struct.unpack_from(
+            "<4sLLL", data, descriptor_offset
+        )
+        assert signature == b"PK\x07\x08"
+        assert descriptor_crc == expected_crc == info.CRC
+        assert descriptor_compressed_size == len(compressed) == info.compress_size
+        assert descriptor_original_size == len(plain) == info.file_size
+
+        central = _central_header(data, "precompressed.bin")
+        central_crc, central_compressed_size, central_original_size = struct.unpack_from(
+            "<LLL", central, 16
+        )
+        assert central_crc == expected_crc
+        assert central_compressed_size == len(compressed)
+        assert central_original_size == len(plain)
+
+        zf.extractall(tmp_path)
+
+    assert tmp_path.joinpath("before.txt").read_bytes() == b"before"
+    assert tmp_path.joinpath("precompressed.bin").read_bytes() == plain
+    assert tmp_path.joinpath("after/after.txt").read_bytes() == b"after"
+
+
+def test_add_compressed_empty_file():
+    compressed = _raw_deflate(b"")
+
+    zs = ZipStream(sized=True)
+    zs.add_compressed(compressed, "empty", 0, len(compressed), 0)
+
+    expected_size = len(zs)
+    with zipfile.ZipFile(io.BytesIO(bytes(zs))) as zf:
+        assert zf.read("empty") == b""
+
+    assert expected_size == 126
+
+
+@pytest.mark.parametrize("sized", [False, True])
+def test_add_compressed_zip64(sized):
+    plain = _randbytes(300)
+    compressed = _raw_deflate(plain)
+    expected_crc = zlib.crc32(plain) & 0xFFFFFFFF
+
+    real_limit = zipstream.ng.ZIP64_LIMIT
+    zipstream.ng.ZIP64_LIMIT = 100
+    try:
+        zs = ZipStream(sized=sized)
+        zs.add_compressed(
+            _chunks(compressed),
+            "precompressed.bin",
+            len(plain),
+            len(compressed),
+            expected_crc,
+        )
+        expected_size = len(zs) if sized else None
+        data = bytes(zs)
+    finally:
+        zipstream.ng.ZIP64_LIMIT = real_limit
+
+    if sized:
+        assert expected_size == len(data)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        info = zf.getinfo("precompressed.bin")
+        assert info.file_size == len(plain)
+        assert info.compress_size == len(compressed)
+        assert info.CRC == expected_crc
+        assert zf.read(info) == plain
+
+        local_header = struct.unpack_from("<4sHHHHHLLLHH", data, info.header_offset)
+        filename_length = local_header[9]
+        extra_length = local_header[10]
+        assert extra_length == 20
+        descriptor_offset = info.header_offset + 30 + filename_length + extra_length + len(compressed)
+        signature, descriptor_crc = struct.unpack_from("<4sL", data, descriptor_offset)
+        descriptor_compressed_size, descriptor_original_size = struct.unpack_from(
+            "<QQ", data, descriptor_offset + 8
+        )
+        assert signature == b"PK\x07\x08"
+        assert descriptor_crc == expected_crc == info.CRC
+        assert descriptor_compressed_size == len(compressed) == info.compress_size
+        assert descriptor_original_size == len(plain) == info.file_size
+
+        central = _central_header(data, "precompressed.bin")
+        central_crc, central_compressed_size, central_original_size = struct.unpack_from(
+            "<LLL", central, 16
+        )
+        assert central_crc == expected_crc
+        assert central_compressed_size == 0xFFFFFFFF
+        assert central_original_size == 0xFFFFFFFF
+        central_zip64_original_size, central_zip64_compressed_size = struct.unpack_from(
+            "<QQ", central, 46 + len("precompressed.bin") + 4
+        )
+        assert central_zip64_compressed_size == len(compressed)
+        assert central_zip64_original_size == len(plain)
+
+
+@pytest.mark.parametrize("verify", [True, False])
+@pytest.mark.parametrize("wrapper", [zlib.compress, gzip.compress])
+def test_add_compressed_rejects_wrapped_deflate(wrapper, verify):
+    plain = b"wrapped deflate data"
+    compressed = wrapper(plain)
+    zs = ZipStream()
+    zs.add_compressed(
+        compressed,
+        "wrapped.bin",
+        len(plain),
+        len(compressed),
+        zlib.crc32(plain) & 0xFFFFFFFF,
+        verify=verify,
+    )
+
+    output = []
+    with pytest.raises(ValueError, match="raw DEFLATE|wrapped stream"):
+        for chunk in zs.finalize():
+            output.append(chunk)
+
+    _assert_no_footer(b"".join(output))
+    _assert_footer_refused(zs)
+
+
+def test_add_compressed_rejects_invalid_method_and_arguments():
+    with pytest.raises(ValueError, match="only supports ZIP_DEFLATED"):
+        ZipStream().add_compressed(
+            b"", "x", 0, 0, 0, compress_type=zipfile.ZIP_STORED
+        )
+
+    with pytest.raises(ValueError, match="original_size must be non-negative"):
+        ZipStream().add_compressed(b"", "x", -1, 0, 0)
+
+    with pytest.raises(ValueError, match="crc32 must be between"):
+        ZipStream().add_compressed(b"", "x", 0, 0, 0x100000000)
+
+
+@pytest.mark.parametrize(
+    "declared_size,message",
+    [
+        (None, "CRC32 mismatch"),
+        (10, "larger than its declared compressed size"),
+        (999, "Compressed size mismatch"),
+    ],
+)
+def test_add_compressed_integrity_failures_do_not_emit_footer(declared_size, message):
+    plain = _randbytes(500)
+    compressed = _raw_deflate(plain)
+    expected_crc = zlib.crc32(plain) & 0xFFFFFFFF
+    if declared_size is None:
+        declared_size = len(compressed)
+
+    zs = ZipStream()
+    zs.add(b"before", "before.txt")
+    zs.add_compressed(
+        _chunks(compressed),
+        "broken.bin",
+        len(plain),
+        declared_size,
+        expected_crc ^ 1 if message == "CRC32 mismatch" else expected_crc,
+    )
+
+    output = []
+    with pytest.raises(ValueError, match=message):
+        for chunk in zs.finalize():
+            output.append(chunk)
+
+    _assert_no_footer(b"".join(output))
+    _assert_footer_refused(zs)
+
+
+def test_add_compressed_source_interruption_does_not_emit_footer():
+    plain = _randbytes(500)
+    compressed = _raw_deflate(plain)
+
+    def interrupted():
+        yield compressed[:8]
+        raise RuntimeError("source interrupted")
+
+    zs = ZipStream()
+    zs.add(b"before", "before.txt")
+    zs.add_compressed(
+        interrupted(),
+        "broken.bin",
+        len(plain),
+        len(compressed),
+        zlib.crc32(plain) & 0xFFFFFFFF,
+        verify=False,
+    )
+
+    output = []
+    with pytest.raises(RuntimeError, match="source interrupted"):
+        for chunk in zs.finalize():
+            output.append(chunk)
+
+    _assert_no_footer(b"".join(output))
+    _assert_footer_refused(zs)
+
+
+def test_add_compressed_unverified_still_checks_compressed_length(caplog):
+    caplog.set_level(logging.WARNING)
+    plain = _randbytes(100)
+    compressed = _raw_deflate(plain)
+
+    zs = ZipStream()
+    zs.add_compressed(
+        _chunks(compressed),
+        "broken.bin",
+        len(plain),
+        len(compressed) + 1,
+        zlib.crc32(plain) & 0xFFFFFFFF,
+        verify=False,
+    )
+
+    output = []
+    with pytest.raises(ValueError, match="Compressed size mismatch"):
+        for chunk in zs.finalize():
+            output.append(chunk)
+
+    _assert_no_footer(b"".join(output))
+    assert "trusting caller-provided raw DEFLATE data" in caplog.text
+
+
+def test_add_compressed_unverified_rejects_extra_compressed_bytes():
+    plain = _randbytes(100)
+    compressed = _raw_deflate(plain)
+
+    zs = ZipStream()
+    zs.add_compressed(
+        _chunks(compressed, 3),
+        "broken.bin",
+        len(plain),
+        len(compressed) - 1,
+        zlib.crc32(plain) & 0xFFFFFFFF,
+        verify=False,
+    )
+
+    with pytest.raises(ValueError, match="larger than its declared compressed size"):
+        bytes(zs)
 
 
 @pytest.mark.parametrize("ct", COMPRESS_TYPES)
