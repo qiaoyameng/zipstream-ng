@@ -17,6 +17,8 @@ calculate the final size of the zip file before streaming it.
  - Performant: On-par or faster than using the standard library to create non-streamed zip files.
  - Flexible API: Typical use cases are simple, complicated ones are possible.
  - Supports zipping data from files, bytes, strings, and any other iterable objects.
+ - Supports adding pre-compressed data (ie. raw DEFLATE from object storage) without
+   re-compressing it, with optional streaming integrity verification.
  - Keeps track of the date of the most recently modified file added to the zip file.
  - Threadsafe: Won't mangle data if multiple threads concurrently add data to the same stream.
  - Includes a clone of Python's `http.server` module with zip support added. Try `python -m zipstream.server`.

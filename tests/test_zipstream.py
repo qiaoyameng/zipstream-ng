@@ -9,6 +9,7 @@ import logging
 import ntpath
 import os
 import random
+import struct
 import sys
 import time
 import zipfile
@@ -1766,3 +1767,307 @@ def test_zip64_real(tmpdir):
 
         with zf.open("small.bin", "r") as fp:
             assert smalldata == fp.read()
+
+
+################################
+# Pre-compressed data tests
+################################
+
+def _raw_deflate(data, level=9):
+    compressor = zlib.compressobj(level, zlib.DEFLATED, -15)
+    return compressor.compress(data) + compressor.flush()
+
+
+def _chunked(data, n=64):
+    return [data[i:i + n] for i in range(0, len(data), n)]
+
+
+def test_add_compressed_mixed_with_normal_members():
+    """Pre-compressed members can be mixed with normal ones"""
+    raw = _randbytes(100 * 1024)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add(b"plain data", "first.txt")
+    zs.add_compressed(
+        _chunked(compressed), "middle.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed), crc=crc,
+    )
+    zs.add(b"more plain data", "last.txt")
+
+    # The queued entry should already report the declared values
+    queued = {i["name"]: i for i in zs.info_list()}
+    assert queued["middle.bin"]["compressed_size"] == len(compressed)
+    assert queued["middle.bin"]["size"] == len(raw)
+    assert queued["middle.bin"]["CRC"] == crc
+
+    zf = _get_zip(zs)
+    assert zf.namelist() == ["first.txt", "middle.bin", "last.txt"]
+    assert zf.read("first.txt") == b"plain data"
+    assert zf.read("middle.bin") == raw
+    assert zf.read("last.txt") == b"more plain data"
+    assert zf.testzip() is None
+
+    zinfo = zf.getinfo("middle.bin")
+    assert zinfo.compress_type == zipfile.ZIP_DEFLATED
+    assert zinfo.CRC == crc
+    assert zinfo.file_size == len(raw)
+    assert zinfo.compress_size == len(compressed)
+
+    # The streamed entry should report the declared values too
+    streamed = {i["name"]: i for i in zs.info_list()}
+    assert streamed["middle.bin"]["CRC"] == crc
+    assert streamed["middle.bin"]["compressed_size"] == len(compressed)
+
+
+def test_add_compressed_stored():
+    """Pre-compressed data can also use ZIP_STORED (bytes input allowed)"""
+    raw = _randbytes(1024)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add_compressed(
+        raw, "stored.bin",
+        compress_type=zipfile.ZIP_STORED,
+        size=len(raw), compress_size=len(raw), crc=crc,
+    )
+
+    zf = _get_zip(zs)
+    assert zf.read("stored.bin") == raw
+    zinfo = zf.getinfo("stored.bin")
+    assert zinfo.compress_type == zipfile.ZIP_STORED
+    assert zinfo.CRC == crc
+
+
+def test_add_compressed_zip64(monkeypatch):
+    """Zip64 extra fields, data descriptor, and central directory agree"""
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 100)
+    monkeypatch.setattr(zipstream.ng, "ZIP64_LIMIT", 100)
+
+    raw = _randbytes(1024)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add_compressed(
+        _chunked(compressed), "big.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed), crc=crc,
+    )
+
+    data = bytes(zs)
+    zf = _get_zip(data)
+    assert zf.read("big.bin") == raw
+    zinfo = zf.getinfo("big.bin")
+    assert zinfo.CRC == crc
+    assert zinfo.file_size == len(raw)
+    assert zinfo.compress_size == len(compressed)
+
+    # The zip64 data descriptor holds the same values as the central directory
+    dd = data.rindex(b"PK\x07\x08")
+    dd_crc, dd_csize, dd_size = struct.unpack("<LQQ", data[dd + 4:dd + 24])
+    assert dd_crc == crc
+    assert dd_csize == len(compressed)
+    assert dd_size == len(raw)
+
+
+def test_add_compressed_without_verify(caplog):
+    """Disabling verification logs that the caller's values are trusted"""
+    raw = _randbytes(4096)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add_compressed(
+        _chunked(compressed), "noverify.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed), crc=crc,
+        verify=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        zf = _get_zip(zs)
+
+    assert zf.read("noverify.bin") == raw
+    assert "relying on the caller-declared" in caplog.text
+
+
+def test_add_compressed_bad_crc():
+    """A wrong CRC aborts the stream before the footer is written"""
+    raw = _randbytes(4096)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add(b"ok", "ok.txt")
+    zs.add_compressed(
+        _chunked(compressed), "bad.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed), crc=crc ^ 0xFF,
+    )
+
+    out = io.BytesIO()
+    with pytest.raises(RuntimeError, match="CRC mismatch"):
+        out.writelines(zs)
+
+    # No footer claiming success may be emitted
+    assert b"PK\x05\x06" not in out.getvalue()
+
+
+@pytest.mark.parametrize("verify", [True, False])
+@pytest.mark.parametrize("delta", [-5, 5])
+def test_add_compressed_size_mismatch(verify, delta):
+    """A wrong declared compressed size always aborts the stream"""
+    raw = _randbytes(4096)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add_compressed(
+        _chunked(compressed), "bad.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed) + delta, crc=crc,
+        verify=verify,
+    )
+
+    out = io.BytesIO()
+    with pytest.raises(RuntimeError, match="Compressed size mismatch"):
+        out.writelines(zs)
+
+    assert b"PK\x05\x06" not in out.getvalue()
+
+
+def test_add_compressed_interrupted_source():
+    """An error from the source iterable aborts the stream, no footer"""
+    raw = _randbytes(4096)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+    chunks = _chunked(compressed)
+
+    def broken():
+        yield chunks[0]
+        raise IOError("source went away")
+
+    zs = ZipStream()
+    zs.add_compressed(
+        broken(), "broken.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed), crc=crc,
+    )
+
+    out = io.BytesIO()
+    with pytest.raises(IOError):
+        out.writelines(zs)
+
+    assert b"PK\x05\x06" not in out.getvalue()
+
+
+def test_add_compressed_truncated_source():
+    """A source that ends early aborts the stream, no footer"""
+    raw = _randbytes(4096)
+    compressed = _raw_deflate(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add_compressed(
+        iter(_chunked(compressed)[:-1]), "truncated.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(compressed), crc=crc,
+    )
+
+    out = io.BytesIO()
+    with pytest.raises(RuntimeError, match="Compressed size mismatch"):
+        out.writelines(zs)
+
+    assert b"PK\x05\x06" not in out.getvalue()
+
+
+def test_add_compressed_rejects_zlib_wrapped_data():
+    """zlib-wrapped data is not valid raw DEFLATE and fails verification"""
+    raw = _randbytes(4096)
+    wrapped = zlib.compress(raw)
+    crc = zlib.crc32(raw) & 0xFFFFFFFF
+
+    zs = ZipStream()
+    zs.add_compressed(
+        [wrapped], "wrapped.bin",
+        compress_type=zipfile.ZIP_DEFLATED,
+        size=len(raw), compress_size=len(wrapped), crc=crc,
+    )
+
+    out = io.BytesIO()
+    with pytest.raises(RuntimeError):
+        out.writelines(zs)
+
+    assert b"PK\x05\x06" not in out.getvalue()
+
+
+def test_add_compressed_invalid_args():
+    """Invalid arguments to add_compressed are rejected up-front"""
+    zs = ZipStream()
+
+    # compress_type is a required keyword argument
+    with pytest.raises(TypeError):
+        zs.add_compressed([b""], "x", size=0, compress_size=0, crc=0)
+
+    # empty arcname
+    with pytest.raises(ValueError):
+        zs.add_compressed(
+            [b""], "", compress_type=zipfile.ZIP_DEFLATED,
+            size=0, compress_size=0, crc=0,
+        )
+
+    # directories can't hold data
+    with pytest.raises(ValueError):
+        zs.add_compressed(
+            [b""], "dir/", compress_type=zipfile.ZIP_DEFLATED,
+            size=0, compress_size=0, crc=0,
+        )
+
+    # data must be bytes or an iterable
+    with pytest.raises(TypeError):
+        zs.add_compressed(
+            42, "x", compress_type=zipfile.ZIP_DEFLATED,
+            size=0, compress_size=0, crc=0,
+        )
+
+    # unknown compression methods are rejected
+    with pytest.raises(NotImplementedError):
+        zs.add_compressed(
+            [b""], "x", compress_type=99,
+            size=0, compress_size=0, crc=0,
+        )
+
+    # negative sizes
+    with pytest.raises(ValueError):
+        zs.add_compressed(
+            [b""], "x", compress_type=zipfile.ZIP_DEFLATED,
+            size=-1, compress_size=0, crc=0,
+        )
+
+    # CRC out of range
+    with pytest.raises(ValueError):
+        zs.add_compressed(
+            [b""], "x", compress_type=zipfile.ZIP_DEFLATED,
+            size=0, compress_size=0, crc=1 << 32,
+        )
+
+    # stored data must have matching sizes
+    with pytest.raises(ValueError):
+        zs.add_compressed(
+            [b"ab"], "x", compress_type=zipfile.ZIP_STORED,
+            size=1, compress_size=2, crc=0,
+        )
+
+    # nothing invalid should have been queued
+    assert zs.is_empty()
+
+    # adding after finalizing is an error
+    bytes(zs)
+    with pytest.raises(RuntimeError):
+        zs.add_compressed(
+            [b""], "x", compress_type=zipfile.ZIP_DEFLATED,
+            size=0, compress_size=0, crc=0,
+        )

@@ -29,7 +29,8 @@ from zipfile import (
     sizeFileHeader, sizeCentralDir, sizeEndCentDir, sizeEndCentDir64Locator,
     sizeEndCentDir64,
     # Functions
-    crc32, _get_compressor, _check_compression as _check_compress_type,
+    crc32, _get_compressor, _get_decompressor,
+    _check_compression as _check_compress_type,
 )
 
 
@@ -319,6 +320,110 @@ class ZipStreamInfo(ZipInfo):
             )
 
         # Yield the data descriptor with the now-valid CRC and file size info
+        yield self.DataDescriptor(zip64)
+
+    def _precompressed_file_data(self, iterable, verify=True):
+        """Given an iterable of already-compressed file data, yield a local
+        file header, the compressed data, and a data descriptor for it.
+
+        The CRC, file size, and compressed size are taken from the values
+        already set on this ZipStreamInfo (declared by the caller). The actual
+        number of compressed bytes yielded by `iterable` is always checked
+        against the declared compressed size. If `verify` is True, the data is
+        also decompressed on the fly and the decompressed size and CRC are
+        checked against the declared values.
+        """
+        if self.is_dir():  # pragma: no cover
+            raise ValueError("Can't store pre-compressed data as a directory")
+
+        # Set the data descriptor flag so the filesizes and CRC are added
+        # after the file data
+        self.flag_bits |= _FLAG_DATA_DESCRIPTOR
+
+        # The exact sizes are known up-front, so no estimation is required
+        zip64 = max(self.file_size, self.compress_size) > ZIP64_LIMIT
+
+        # Make header
+        yield self.FileHeader(zip64)
+
+        decompressor = _get_decompressor(self.compress_type) if verify else None
+        crc = 0
+        file_size = 0
+        compress_size = 0
+
+        for buf in iterable:
+            compress_size += len(buf)
+            if verify:
+                if decompressor:
+                    try:
+                        buf_data = decompressor.decompress(buf)
+                    except Exception as e:
+                        raise RuntimeError(
+                            "Error decompressing pre-compressed data for '{}' "
+                            "during verification: {}".format(self.filename, e)
+                        ) from e
+                else:
+                    buf_data = buf
+                file_size += len(buf_data)
+                crc = crc32(buf_data, crc) & 0xFFFFFFFF
+            yield buf
+
+        # The actual amount of compressed data must always match what was
+        # declared, regardless of whether full verification is enabled
+        if compress_size != self.compress_size:
+            raise RuntimeError(
+                "Compressed size mismatch when adding '{}' "
+                "(declared {} bytes, got {})".format(
+                    self.filename, self.compress_size, compress_size
+                )
+            )
+
+        if verify:
+            if decompressor is not None:
+                # Flush any remaining decompressed data (not all decompressors
+                # support flushing)
+                flush = getattr(decompressor, "flush", None)
+                if flush is not None:
+                    try:
+                        buf_data = flush()
+                    except Exception as e:
+                        raise RuntimeError(
+                            "Error decompressing pre-compressed data for '{}' "
+                            "during verification: {}".format(self.filename, e)
+                        ) from e
+                    file_size += len(buf_data)
+                    crc = crc32(buf_data, crc) & 0xFFFFFFFF
+
+                # Where detectable, ensure the compressed stream was complete
+                # and not truncated
+                if getattr(decompressor, "eof", True) is False:
+                    raise RuntimeError(
+                        "Compressed data for '{}' ended before the "
+                        "compression stream was complete".format(self.filename)
+                    )
+
+            if file_size != self.file_size:
+                raise RuntimeError(
+                    "Size mismatch when adding pre-compressed data for '{}' "
+                    "(declared {} bytes, decompressed {})".format(
+                        self.filename, self.file_size, file_size
+                    )
+                )
+            if crc != self.CRC:
+                raise RuntimeError(
+                    "CRC mismatch when adding pre-compressed data for '{}'".format(
+                        self.filename
+                    )
+                )
+        else:
+            __log__.warning(
+                "Integrity verification disabled for pre-compressed data of "
+                "'%s'; relying on the caller-declared CRC (%#010x), size (%d), "
+                "and compression method",
+                self.filename, self.CRC, self.file_size
+            )
+
+        # Yield the data descriptor with the declared CRC and file size info
         yield self.DataDescriptor(zip64)
 
     def _central_directory_header_data(self):
@@ -658,7 +763,10 @@ class ZipStream:
         # first will cause corrupted streams. Prevent this by adding a lock
         # around the functions that actually generate data.
         with self._gen_lock:
-            yield from self._gen_file_entry(**kwargs)
+            if kwargs.pop("precompressed", False):
+                yield from self._gen_compressed_file_entry(**kwargs)
+            else:
+                yield from self._gen_file_entry(**kwargs)
         return True
 
     def all_files(self):
@@ -852,6 +960,89 @@ class ZipStream:
 
         self.add(data=None, arcname=arcname)
 
+    @_validate_final
+    def add_compressed(self, iterable, arcname, *, compress_type, size, compress_size, crc, verify=True):
+        """Queue up pre-compressed data to be added to the ZipStream
+
+        This is useful when the data is already stored in compressed form
+        (ie. in object storage) and re-compressing it would be wasteful.
+
+        `iterable` (required) must be bytes or an iterable of bytes chunks
+        containing the compressed data exactly as it will be stored in the
+        archive.
+
+        `arcname` (required) is the name of the file to store the data in. It
+        cannot end with a "/" as this would create a directory (which can't
+        contain content).
+
+        `compress_type` (required) is the ZIP compression method the data was
+        compressed with and must be given explicitly - one of ZIP_STORED,
+        ZIP_DEFLATED, ZIP_BZIP2, ZIP_LZMA, or ZIP_ZSTANDARD (Python 3.14+).
+        The data must be in the exact format the ZIP specification requires
+        for that method. In particular, for ZIP_DEFLATED the data must be a
+        raw DEFLATE stream - zlib- or gzip-wrapped data is NOT valid and will
+        fail verification (or produce a corrupt archive if verification is
+        disabled).
+
+        `size` (required) is the size of the original uncompressed data.
+
+        `compress_size` (required) is the size of the compressed data. The
+        actual number of bytes yielded by `iterable` is always checked against
+        this value when the file is streamed.
+
+        `crc` (required) is the CRC32 of the original uncompressed data.
+
+        `verify` (optional, default True) enables streaming integrity
+        verification: while the compressed data is streamed out, it is also
+        decompressed in parallel and the decompressed size and CRC are checked
+        against the declared values. If verification is disabled, a warning is
+        logged and the declared values are trusted as-is (the compressed byte
+        count is still always checked).
+
+        Note that the iterable will not be consumed until the file is actually
+        encoded in the ZipStream. If the declared values don't match the data
+        (or the iterable raises partway through), an exception will be raised
+        while the ZipStream is being generated and no archive footer will be
+        produced.
+
+        Raises a ValueError if the arcname, sizes, or CRC are invalid.
+        Raises a TypeError if the data is not an iterable of bytes.
+        Raises a RuntimeError if the ZipStream has already been finalized.
+        """
+        arcname = _sanitize_arcname(arcname)
+        if not arcname:
+            raise ValueError("A valid arcname is required")
+
+        if arcname[-1] in PATH_SEPARATORS:
+            raise ValueError("Can't store pre-compressed data as a directory")
+
+        if isinstance(iterable, (bytes, bytearray)):
+            iterable = (bytes(iterable),)
+        elif not hasattr(iterable, "__iter__"):
+            raise TypeError("Pre-compressed data must be an iterable of bytes")
+
+        _check_compression(compress_type, None)
+
+        if size < 0 or compress_size < 0:
+            raise ValueError("Sizes must be non-negative")
+        if not 0 <= crc <= 0xFFFFFFFF:
+            raise ValueError("crc must be a valid CRC32 (0 to 4294967295)")
+        if compress_type == ZIP_STORED and compress_size != size:
+            raise ValueError(
+                "compress_size must equal size when using ZIP_STORED"
+            )
+
+        self._enqueue(
+            iterable=iterable,
+            arcname=arcname,
+            compress_type=compress_type,
+            size=size,
+            compress_size=compress_size,
+            crc=crc,
+            verify=verify,
+            precompressed=True,
+        )
+
     @property
     def sized(self):
         """True if the ZipStream's final size is known"""
@@ -946,6 +1137,8 @@ class ZipStream:
                 compress_type = x.get("compress_type", self._compress_type)
                 if is_dir:
                     compress_size = 0
+                elif x.get("precompressed"):
+                    compress_size = x.get("compress_size")
                 elif compress_type == ZIP_STORED:
                     compress_size = x.get("size")
                 else:
@@ -957,7 +1150,7 @@ class ZipStream:
                     "compressed_size": compress_size,
                     "datetime": None,
                     "is_dir": is_dir,
-                    "CRC": None,
+                    "CRC": x.get("crc") if x.get("precompressed") else None,
                     "compress_type": compress_type,
                     "compress_level": x.get("compress_level", self._compress_level),
                     "streamed": False,
@@ -1156,6 +1349,31 @@ class ZipStream:
                     "Error adding '{}' to sized ZipStream - "
                     "actual size did not match the computed size".format(arcname)
                 )
+
+        self._filelist.append(zinfo)
+
+    def _gen_compressed_file_entry(self, *, iterable, size, compress_size, crc, arcname, compress_type=None, verify=True):
+        """Yield the zipped data for pre-compressed data added with add_compressed"""
+        zinfo = ZipStreamInfo(arcname)
+        # Set the external attributes in the same way as ZipFile.writestr
+        zinfo.external_attr = 0o100600 << 16  # -rw-------
+
+        zinfo.compress_type = compress_type if compress_type is not None else self._compress_type
+        if not PY36_COMPAT:
+            # The data is already compressed - the level is only informational
+            zinfo._compresslevel = None
+
+        # The CRC and sizes are declared by the caller
+        zinfo.CRC = crc
+        zinfo.file_size = size
+        zinfo.compress_size = compress_size
+
+        # Store the position of the header
+        zinfo.header_offset = self._pos
+
+        # Generate the file data
+        for x in zinfo._precompressed_file_data(iterable, verify=verify):
+            yield self._track(x)
 
         self._filelist.append(zinfo)
 

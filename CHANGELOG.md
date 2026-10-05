@@ -1,6 +1,13 @@
 zipstream-ng changelog
 ======================
 
+### [Unreleased]
+- Add `ZipStream.add_compressed` for adding pre-compressed data (ie. raw DEFLATE stored in
+  object storage) without decompressing and re-compressing it. The ZIP compression method must
+  be specified explicitly, and the uncompressed size, compressed size, and CRC32 are declared
+  by the caller. Streaming integrity verification is enabled by default and can be disabled
+  with `verify=False` (the actual compressed byte count is always checked)
+
 ### [v1.9.3]
 - Fix length calculation when adding extended ascii filenames (only affects Python 3.13.14+, 3.14.6+, 3.15+)
 
