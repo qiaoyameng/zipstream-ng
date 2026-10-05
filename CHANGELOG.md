@@ -1,6 +1,10 @@
 zipstream-ng changelog
 ======================
 
+### Unreleased
+- Add `SeekableZipStream` for seekable half-open range reads of known `ZIP_STORED` archives
+- Detect seekable source changes and invalidate archive views instead of returning inconsistent bytes
+
 ### [v1.9.3]
 - Fix length calculation when adding extended ascii filenames (only affects Python 3.13.14+, 3.14.6+, 3.15+)
 

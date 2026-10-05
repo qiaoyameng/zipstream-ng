@@ -176,6 +176,33 @@ def gen_zipfile():
 ```
 
 
+### Seekable range reads for known ZIP_STORED files
+
+When every entry uses `ZIP_STORED` and the entry metadata (size and CRC) is known ahead of
+time, `SeekableZipStream` can expose the complete ZIP archive as a seekable file without
+reading the entry data while building it. Only byte ranges that intersect an entry's data
+are read from that entry's seekable source; local headers, data descriptors, central
+directory records, and ZIP64 records are generated virtually.
+
+The source version must be supplied so changes can be detected. A callable returning a
+value that changes with the content can be provided, as can a zero-argument `state()`
+method on the source object. A fixed token is also valid for sources that are guaranteed
+not to change. Real file objects default to their `fstat()` identity, size, and
+timestamps. If a source changes, the entire archive view is invalidated instead of
+returning bytes from two different source versions.
+
+```python
+from zipstream import SeekableZipStream
+
+entries = [
+    (file_obj, "large.bin", file_size, file_crc32, lambda: file_version),
+]
+archive = SeekableZipStream(entries)
+
+chunk = archive.read_range(start, end)  # half-open byte range
+```
+
+
 Comparison to stdlib
 --------------------
 Since Python 3.6 it has actually been possible to generate zip files as a stream using just the

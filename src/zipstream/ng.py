@@ -3,9 +3,11 @@
 """A modern and easy to use streamable zip file generator"""
 
 import collections
+import copy
 import datetime
 import errno
 import functools
+import io
 import logging
 import os
 import stat
@@ -71,7 +73,7 @@ if not PY313_COMPAT:
 
 __all__ = [
     # Defined classes
-    "ZipStream", "ZipStreamInfo",
+    "ZipStream", "ZipStreamInfo", "SeekableZipStream", "SeekableZipEntry", "SourceChangedError",
     # Compression constants (imported from zipfile)
     "ZIP_STORED",
     "ZIP_DEFLATED",
@@ -485,6 +487,491 @@ def _iter_file(path):
             if not buf:
                 break
             yield buf
+
+
+_ArchiveFooterPart = collections.namedtuple("_ArchiveFooterPart", ["kind", "data"])
+
+
+def _archive_footer_parts(filelist, pos, comment):
+    """Build the central directory and end-of-archive records"""
+    parts = []
+    centDirOffset = pos
+
+    for zinfo in filelist:
+        part = zinfo._central_directory_header_data()
+        parts.append(_ArchiveFooterPart("central_directory_header", part))
+        pos += len(part)
+
+    zip64EndRecStart = pos
+    centDirCount = len(filelist)
+    centDirSize = zip64EndRecStart - centDirOffset
+    if (centDirCount >= ZIP_FILECOUNT_LIMIT or
+        centDirOffset > ZIP64_LIMIT or
+        centDirSize > ZIP64_LIMIT
+    ):
+        zip64EndRec = struct.pack(
+            structEndArchive64,
+            stringEndArchive64,
+            44,
+            ZIP64_VERSION,
+            ZIP64_VERSION,
+            0,
+            0,
+            centDirCount,
+            centDirCount,
+            centDirSize,
+            centDirOffset,
+        )
+        zip64LocRec = struct.pack(
+            structEndArchive64Locator,
+            stringEndArchive64Locator,
+            0,
+            zip64EndRecStart,
+            1,
+        )
+        parts.append(_ArchiveFooterPart("zip64_end_record", zip64EndRec))
+        parts.append(_ArchiveFooterPart("zip64_locator", zip64LocRec))
+        pos += len(zip64EndRec) + len(zip64LocRec)
+
+        centDirCount = min(centDirCount, 0xFFFF)
+        centDirSize = min(centDirSize, 0xFFFFFFFF)
+        centDirOffset = min(centDirOffset, 0xFFFFFFFF)
+
+    endRec = struct.pack(
+        structEndArchive,
+        stringEndArchive,
+        0,
+        0,
+        centDirCount,
+        centDirCount,
+        centDirSize,
+        centDirOffset,
+        len(comment)
+    )
+    parts.append(_ArchiveFooterPart("end_of_central_directory", endRec + comment))
+    return parts
+
+
+class SourceChangedError(RuntimeError):
+    """Raised when a seekable source no longer matches an archive view"""
+
+
+_SeekableSegment = collections.namedtuple(
+    "_SeekableSegment",
+    ["kind", "start", "end", "data", "entry"]
+)
+
+
+class SeekableZipEntry:
+    """Fixed metadata for a ZIP_STORED entry in a SeekableZipStream"""
+
+    def __init__(
+        self, source, info, size=None, crc=None, state=None,
+        date_time=None, external_attr=None
+    ):
+        if isinstance(info, ZipInfo):
+            zinfo = copy.copy(info)
+            if size is not None:
+                zinfo.file_size = size
+            if crc is not None:
+                zinfo.CRC = crc
+        else:
+            if size is None or crc is None:
+                raise ValueError("size and crc are required when info is a filename")
+            zinfo = ZipStreamInfo(info, date_time)
+            zinfo.file_size = size
+            zinfo.CRC = crc
+            if zinfo.is_dir():
+                zinfo.external_attr = (0o40775 << 16) | _FLAG_IS_DIRECTORY
+            else:
+                zinfo.external_attr = 0o100600 << 16
+
+        if date_time is not None:
+            zinfo.date_time = date_time
+        if external_attr is not None:
+            zinfo.external_attr = external_attr
+
+        if zinfo.compress_type != ZIP_STORED:
+            raise ValueError("SeekableZipEntry only supports ZIP_STORED")
+        if zinfo.is_dir():
+            zinfo.CRC = 0
+
+        if not isinstance(getattr(zinfo, "CRC", 0), int) or not 0 <= zinfo.CRC <= 0xFFFFFFFF:
+            raise ValueError("CRC must be an unsigned 32-bit integer")
+        if not isinstance(zinfo.file_size, int) or zinfo.file_size < 0:
+            raise ValueError("size must be a non-negative integer")
+
+        self.zinfo = zinfo
+        self.source = source
+        self.state_callback = state
+        self.state = None
+
+
+class SeekableZipStream(io.IOBase):
+    """A seekable virtual view of an uncompressed ZIP archive
+
+    Entries must use ZIP_STORED and provide fixed metadata, including their
+    size and CRC. File contents are read from seekable sources only for the
+    byte ranges that request them.
+
+    Source changes are detected with a zero-argument state callback. A fixed
+    equality token may be supplied for a source that is guaranteed not to
+    change. Real file objects default to an os.fstat-based state. The value
+    returned by the callback must change whenever the source contents change
+    (for example a version number, ETag, or size/mtime tuple).
+    """
+
+    def __init__(self, entries=(), comment=b""):
+        if comment is None:
+            comment = b""
+        elif isinstance(comment, str):
+            comment = comment.encode("utf-8")
+        elif isinstance(comment, bytearray):
+            comment = bytes(comment)
+        if not isinstance(comment, bytes):
+            raise TypeError("comment must be bytes or a string")
+        if len(comment) > ZIP_MAX_COMMENT:
+            raise ValueError("comment is too long")
+
+        self._comment = comment
+        self._entries = []
+        self._filelist = []
+        self._segments = []
+        self._size = 0
+        self._pos = 0
+        self._closed = False
+        self._invalid = False
+        self._lock = threading.RLock()
+
+        for entry in entries:
+            self._entries.append(self._normalize_entry(entry))
+
+        self._build()
+
+    @property
+    def size(self):
+        """The total size of the virtual archive"""
+        return self._size
+
+    @property
+    def layout(self):
+        """A tuple of ``(kind, start, end)`` ranges in the virtual archive"""
+        return tuple((x.kind, x.start, x.end) for x in self._segments)
+
+    def __len__(self):
+        return self._size
+
+    def readable(self):
+        return not self.closed
+
+    def seekable(self):
+        return not self.closed
+
+    def writable(self):
+        return False
+
+    def tell(self):
+        self._check_closed()
+        return self._pos
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        self._check_closed()
+        if whence == io.SEEK_SET:
+            new_pos = offset
+        elif whence == io.SEEK_CUR:
+            new_pos = self._pos + offset
+        elif whence == io.SEEK_END:
+            new_pos = self._size + offset
+        else:
+            raise ValueError("unsupported whence value")
+
+        if not isinstance(new_pos, int) or new_pos < 0 or new_pos > self._size:
+            raise ValueError("invalid seek position")
+        self._pos = new_pos
+        return new_pos
+
+    def read(self, size=-1):
+        self._check_closed()
+        if size is None or size < 0:
+            end = self._size
+        else:
+            end = min(self._size, self._pos + size)
+        data = self.read_range(self._pos, end)
+        self._pos = end
+        return data
+
+    def read1(self, size=-1):
+        return self.read(size)
+
+    def read_range(self, start, end=None):
+        """Read the half-open byte range ``[start, end)`` from the archive"""
+        self._check_closed()
+        if end is None:
+            end = self._size
+        self._validate_range(start, end)
+
+        with self._lock:
+            self._check_state()
+            if start == end:
+                return b""
+            chunks = []
+            for segment in self._segments:
+                if segment.end <= start or segment.start >= end:
+                    continue
+
+                part_start = max(start, segment.start)
+                part_end = min(end, segment.end)
+                if segment.kind == "file_data":
+                    chunks.append(self._read_source(
+                        segment.entry,
+                        part_start - segment.start,
+                        part_end - part_start
+                    ))
+                else:
+                    data_start = part_start - segment.start
+                    data_end = part_end - segment.start
+                    chunks.append(segment.data[data_start:data_end])
+
+            self._check_state()
+
+            return b"".join(chunks)
+
+    def _normalize_entry(self, entry):
+        if isinstance(entry, SeekableZipEntry):
+            seekable_entry = copy.copy(entry)
+            seekable_entry.zinfo = copy.copy(entry.zinfo)
+        elif isinstance(entry, ZipInfo):
+            seekable_entry = SeekableZipEntry(None, entry)
+        elif isinstance(entry, dict):
+            source = entry.get("source")
+            state = entry.get("state")
+            if "info" in entry:
+                seekable_entry = SeekableZipEntry(
+                    source, entry["info"],
+                    size=entry.get("size"),
+                    crc=entry.get("crc"),
+                    state=state,
+                    date_time=entry.get("date_time"),
+                    external_attr=entry.get("external_attr"),
+                )
+            else:
+                seekable_entry = SeekableZipEntry(
+                    source, entry["filename"], entry["size"], entry["crc"],
+                    state=state,
+                    date_time=entry.get("date_time"),
+                    external_attr=entry.get("external_attr"),
+                )
+        else:
+            if len(entry) == 2:
+                source, info = entry
+                state = None
+            elif len(entry) == 3:
+                source, info, state = entry
+            elif len(entry) == 4:
+                source, filename, size, crc = entry
+                seekable_entry = SeekableZipEntry(source, filename, size, crc)
+                self._prepare_entry(seekable_entry)
+                return seekable_entry
+            elif len(entry) == 5:
+                source, filename, size, crc, state = entry
+                seekable_entry = SeekableZipEntry(source, filename, size, crc, state)
+                self._prepare_entry(seekable_entry)
+                return seekable_entry
+            else:
+                raise ValueError("invalid seekable ZIP entry")
+
+            seekable_entry = SeekableZipEntry(source, info, state=state)
+
+        self._prepare_entry(seekable_entry)
+        return seekable_entry
+
+    def _prepare_entry(self, entry):
+        zinfo = entry.zinfo
+        is_directory = zinfo.is_dir()
+
+        if is_directory:
+            if entry.source is not None:
+                raise ValueError("directory entries cannot have a source")
+            zinfo.file_size = 0
+            zinfo.compress_size = 0
+            zinfo.CRC = 0
+            zinfo.flag_bits &= ~_FLAG_DATA_DESCRIPTOR
+        else:
+            self._check_seekable_source(entry.source)
+            if entry.state_callback is None:
+                source_state = getattr(entry.source, "state", None)
+                if callable(source_state):
+                    entry.state_callback = source_state
+                else:
+                    entry.state_callback = self._default_state_callback(entry.source)
+            elif not callable(entry.state_callback):
+                state_token = entry.state_callback
+                entry.state_callback = lambda token=state_token: token
+            entry.state = entry.state_callback()
+            zinfo.compress_size = zinfo.file_size
+            zinfo.flag_bits |= _FLAG_DATA_DESCRIPTOR
+
+        zinfo.compress_type = ZIP_STORED
+
+    @staticmethod
+    def _check_seekable_source(source):
+        has_seek = callable(getattr(source, "seek", None))
+        has_read = callable(getattr(source, "read", None))
+        if not has_seek or not has_read:
+            raise TypeError("source must support seek() and read()")
+        seekable = getattr(source, "seekable", None)
+        if seekable is not None and not seekable():
+            raise TypeError("source must be seekable")
+
+    @staticmethod
+    def _default_state_callback(source):
+        initial_stat = None
+        fileno = getattr(source, "fileno", None)
+        if callable(fileno):
+            try:
+                initial_stat = os.fstat(fileno())
+            except (OSError, io.UnsupportedOperation, AttributeError):
+                initial_stat = None
+
+        stat_func = getattr(source, "stat", None)
+        if initial_stat is None and callable(stat_func):
+            initial_stat = stat_func()
+
+        if initial_stat is None:
+            raise ValueError(
+                "a callable source state is required for sources without fstat()/stat()"
+            )
+
+        def fstat_state(stat_result):
+            return (
+                stat_result.st_dev,
+                stat_result.st_ino,
+                stat_result.st_size,
+                stat_result.st_mtime_ns,
+                stat_result.st_ctime_ns,
+            )
+
+        def get_state():
+            if callable(fileno):
+                try:
+                    return fstat_state(os.fstat(fileno()))
+                except (OSError, io.UnsupportedOperation, AttributeError):
+                    pass
+            if callable(stat_func):
+                return fstat_state(stat_func())
+            raise SourceChangedError("unable to verify source state")
+
+        return get_state
+
+    def _build(self):
+        pos = 0
+        for entry in self._entries:
+            zinfo = copy.copy(entry.zinfo)
+            is_directory = zinfo.is_dir()
+            zinfo.header_offset = pos
+
+            uses_zip64 = (
+                not is_directory and
+                zinfo.file_size * ZIP64_ESTIMATE_FACTOR > ZIP64_LIMIT
+            )
+            local_header = zinfo.FileHeader(uses_zip64)
+            self._append_static("local_file_header", local_header, pos)
+            pos += len(local_header)
+
+            if not is_directory:
+                end = pos + zinfo.file_size
+                self._segments.append(_SeekableSegment(
+                    "file_data", pos, end, None, entry
+                ))
+                pos = end
+
+                descriptor = zinfo.DataDescriptor(uses_zip64)
+                self._append_static("data_descriptor", descriptor, pos)
+                pos += len(descriptor)
+
+            self._filelist.append(zinfo)
+
+        for part in _archive_footer_parts(self._filelist, pos, self._comment):
+            self._append_static(part.kind, part.data, pos)
+            pos += len(part.data)
+
+        self._size = pos
+
+    def _append_static(self, kind, data, pos):
+        self._segments.append(_SeekableSegment(
+            kind, pos, pos + len(data), data, None
+        ))
+
+    def _validate_range(self, start, end):
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise TypeError("range values must be integers")
+        if start < 0 or end < 0 or start > end or end > self._size:
+            raise ValueError("invalid half-open range")
+
+    def _check_state(self):
+        if self._invalid:
+            raise SourceChangedError("a source changed after the archive view was created")
+
+        for entry in self._entries:
+            if entry.source is None:
+                continue
+            try:
+                current = entry.state_callback()
+            except Exception as exc:
+                self._invalid = True
+                raise SourceChangedError("unable to verify source state") from exc
+            if current != entry.state:
+                self._invalid = True
+                raise SourceChangedError("a source changed after the archive view was created")
+
+    def _read_source(self, entry, offset, size):
+        if size == 0:
+            return b""
+
+        source = entry.source
+        try:
+            source.seek(offset, io.SEEK_SET)
+        except Exception as exc:
+            self._invalid = True
+            raise SourceChangedError("unable to seek source") from exc
+
+        chunks = []
+        remaining = size
+        while remaining:
+            try:
+                buf = source.read(remaining)
+                self._check_state()
+            except SourceChangedError:
+                self._invalid = True
+                raise
+            except Exception as exc:
+                self._invalid = True
+                raise SourceChangedError("unable to read source") from exc
+            if buf is None:
+                self._invalid = True
+                raise SourceChangedError("source returned no data")
+            if isinstance(buf, (bytearray, memoryview)):
+                buf = bytes(buf)
+            elif not isinstance(buf, bytes):
+                self._invalid = True
+                raise TypeError("source.read() must return bytes")
+            if not buf or len(buf) > remaining:
+                self._invalid = True
+                raise SourceChangedError("source returned an unexpected amount of data")
+            chunks.append(buf)
+            remaining -= len(buf)
+        return b"".join(chunks)
+
+    def close(self):
+        self._closed = True
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def _check_closed(self):
+        if self._closed:
+            raise ValueError("I/O operation on closed archive view")
 
 
 def walk(path, preserve_empty=True, followlinks=True):
@@ -1166,59 +1653,8 @@ class ZipStream:
         # Mark the ZipStream as finalized so no other data can be added to it
         self._final = True
 
-        # Write central directory file headers
-        centDirOffset = self._pos
-        for zinfo in self._filelist:
-            yield self._track(zinfo._central_directory_header_data())
-
-        # Write end of central directory record
-        zip64EndRecStart = self._pos
-        centDirCount = len(self._filelist)
-        centDirSize = zip64EndRecStart - centDirOffset
-        if (centDirCount >= ZIP_FILECOUNT_LIMIT or
-            centDirOffset > ZIP64_LIMIT or
-            centDirSize > ZIP64_LIMIT
-        ):
-            # Need to also write a Zip64 end-of-archive record
-            zip64EndRec = struct.pack(
-                structEndArchive64,
-                stringEndArchive64,
-                44,  # size of this record after this point
-                     # (note: no "zip extensible data" is added so this is a constant)
-                ZIP64_VERSION,  # version made by
-                ZIP64_VERSION,  # version needed to extract
-                0,  # disk number this record is on
-                0,  # disk number that contains the start of the central directory
-                centDirCount,
-                centDirCount,
-                centDirSize,
-                centDirOffset,
-            )
-            zip64LocRec = struct.pack(
-                structEndArchive64Locator,
-                stringEndArchive64Locator,
-                0,  # disk number where the zip64EndRec starts
-                zip64EndRecStart,
-                1,  # total number of disks
-            )
-            yield self._track(zip64EndRec + zip64LocRec)
-
-            centDirCount = min(centDirCount, 0xFFFF)
-            centDirSize = min(centDirSize, 0xFFFFFFFF)
-            centDirOffset = min(centDirOffset, 0xFFFFFFFF)
-
-        endRec = struct.pack(
-            structEndArchive,
-            stringEndArchive,
-            0,  # disk number this record is on
-            0,  # disk number that contains the start of the central directory
-            centDirCount,
-            centDirCount,
-            centDirSize,
-            centDirOffset,
-            len(self._comment)
-        )
-        yield self._track(endRec + self._comment)
+        for part in _archive_footer_parts(self._filelist, self._pos, self._comment):
+            yield self._track(part.data)
 
     def _add_size_from_file(self, arcname, size):
         """Add the file to the calculated size of the ZipStream"""

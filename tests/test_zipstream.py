@@ -1766,3 +1766,228 @@ def test_zip64_real(tmpdir):
 
         with zf.open("small.bin", "r") as fp:
             assert smalldata == fp.read()
+
+
+class TrackingSeekableFile:
+    def __init__(self, path):
+        self._fp = open(str(path), "rb")
+        self._size = self._fp.seek(0, io.SEEK_END)
+        self.seek_calls = []
+        self.read_calls = []
+        self._offset = None
+
+    def fileno(self):
+        return self._fp.fileno()
+
+    def seekable(self):
+        return True
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        self.seek_calls.append(offset)
+        self._offset = offset
+        return self._fp.seek(offset, whence)
+
+    def read(self, size=-1):
+        assert self._offset is not None
+        assert 0 <= self._offset
+        assert size >= 0
+        assert self._offset + size <= self._size
+        data = self._fp.read(size)
+        self.read_calls.append((self._offset, len(data)))
+        self._offset += len(data)
+        return data
+
+    def close(self):
+        self._fp.close()
+
+
+def test_seekable_zip_stream_ranges(monkeypatch, tmp_path):
+    """Build a ZIP_STORED archive virtually and reconstruct it in disjoint ranges"""
+    monkeypatch.setattr(zipstream.ng, "ZIP64_LIMIT", 50)
+
+    paths = []
+    for name, size in [
+        ("empty.bin", 0),
+        ("small.bin", 5),
+        ("large.bin", 75),
+    ]:
+        path = tmp_path / name
+        path.write_bytes(_randbytes(size))
+        os.utime(str(path), (1000000000, 1000000000))
+        paths.append(path)
+
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    os.utime(str(directory), (1000000000, 1000000000))
+
+    expected_stream = ZipStream(sized=True)
+    entries = []
+    sources = []
+    infos = []
+
+    for path in paths:
+        expected_stream.add_path(str(path))
+        info = zipstream.ZipStreamInfo.from_file(str(path), path.name)
+        info.CRC = zlib.crc32(path.read_bytes()) & 0xFFFFFFFF
+        source = TrackingSeekableFile(path)
+        sources.append(source)
+        infos.append(info)
+        entries.append((source, info))
+
+    expected_stream.add_path(str(directory))
+    directory_info = zipstream.ZipStreamInfo.from_file(str(directory), "dir/")
+    infos.append(directory_info)
+    entries.append((None, directory_info))
+
+    expected = bytes(expected_stream)
+    view = zipstream.SeekableZipStream(entries)
+
+    assert len(view) == len(expected)
+    eocd = [x for x in view.layout if x[0] == "end_of_central_directory"][-1]
+    assert all(not source.seek_calls and not source.read_calls for source in sources)
+    assert view.read_range(eocd[1], eocd[2]) == expected[eocd[1]:eocd[2]]
+    assert all(not source.seek_calls and not source.read_calls for source in sources)
+
+    assert _get_zip(view.read_range(0, len(view))).testzip() is None
+
+    for source in sources:
+        source.seek_calls.clear()
+        source.read_calls.clear()
+
+    cuts = {0, len(view)}
+    for kind, start, end in view.layout:
+        cuts.update((start, end))
+        if end - start >= 2:
+            cuts.add(start + (end - start) // 2)
+    cuts = sorted(cuts)
+
+    actual = bytearray(len(expected))
+    expected_reads = {id(source): [] for source in sources}
+    ranges = list(zip(cuts, cuts[1:]))
+    random.Random(1234).shuffle(ranges)
+
+    for start, end in ranges:
+        chunk = view.read_range(start, end)
+        assert len(chunk) == end - start
+        actual[start:end] = chunk
+
+        for segment in view._segments:
+            if segment.kind != "file_data" or segment.end <= start or segment.start >= end:
+                continue
+            part_start = max(start, segment.start)
+            part_end = min(end, segment.end)
+            expected_reads[id(segment.entry.source)].append((
+                part_start - segment.start,
+                part_end - part_start
+            ))
+
+    for index, source in enumerate(sources):
+        size = paths[index].stat().st_size
+        assert all(0 <= offset for offset in source.seek_calls)
+        assert all(offset + length <= size for offset, length in source.read_calls)
+        assert source.read_calls == expected_reads[id(source)]
+        if size:
+            assert sum(length for _, length in source.read_calls) == size
+        else:
+            assert not source.read_calls
+
+    assert bytes(actual) == expected
+
+    for source in sources:
+        source.close()
+
+
+def test_seekable_zip_stream_detects_source_change():
+    class VersionedSource:
+        version = 1
+
+        def seek(self, offset, whence=io.SEEK_SET):
+            return offset
+
+        def read(self, size=-1):
+            return b""
+
+        def state(self):
+            return self.version
+
+    with pytest.raises(zipstream.SourceChangedError):
+        view = zipstream.SeekableZipStream([
+            (VersionedSource(), "a.txt", 0, 0)
+        ])
+        VersionedSource.version = 2
+        view.read_range(0, 1)
+
+    state = 1
+
+    def get_state():
+        return state
+
+    source = io.BytesIO(b"abcdef")
+    view = zipstream.SeekableZipStream([
+        (source, "data.txt", 6, zlib.crc32(b"abcdef") & 0xFFFFFFFF, get_state)
+    ])
+
+    assert view.read_range(0, 4) == b"PK\x03\x04"
+    state = 2
+
+    with pytest.raises(zipstream.SourceChangedError):
+        view.read_range(4, 8)
+    with pytest.raises(zipstream.SourceChangedError):
+        view.read_range(0, 4)
+
+
+def test_seekable_zip_stream_filelike_and_validation():
+    crc = zlib.crc32(b"abc") & 0xFFFFFFFF
+    source = io.BytesIO(b"abc")
+    view = zipstream.SeekableZipStream([
+        (source, "a.txt", 3, crc, lambda: 1)
+    ])
+
+    assert view.readable()
+    assert view.seekable()
+    assert not view.writable()
+    assert view.read(4) == b"PK\x03\x04"
+    assert view.tell() == 4
+    body_start = next(x[1] for x in view.layout if x[0] == "file_data")
+    assert view.seek(body_start) == body_start
+    assert view.read(3) == b"abc"
+
+    with pytest.raises(ValueError):
+        view.read_range(-1, 1)
+    with pytest.raises(ValueError):
+        view.read_range(2, 1)
+    with pytest.raises(ValueError):
+        view.read_range(0, len(view) + 1)
+
+
+def test_seekable_zip_stream_rejects_compression_and_nonseekable_source():
+    info = zipstream.ZipStreamInfo("a.txt")
+    info.file_size = 3
+    info.compress_type = zipfile.ZIP_DEFLATED
+
+    with pytest.raises(ValueError, match="ZIP_STORED"):
+        zipstream.SeekableZipEntry(io.BytesIO(b"abc"), info, crc=0)
+
+    class Unseekable:
+        def read(self, size=-1):
+            return b""
+
+    with pytest.raises(TypeError, match="seek"):
+        zipstream.SeekableZipStream([
+            (Unseekable(), "a.txt", 0, 0, lambda: 1)
+        ])
+
+
+def test_seekable_zip_stream_rejects_truncated_source_once_detected():
+    source = io.BytesIO(b"ab")
+    view = zipstream.SeekableZipStream([
+        (source, "a.txt", 3, zlib.crc32(b"abc") & 0xFFFFFFFF, lambda: 1)
+    ])
+    body_start, body_end = next(
+        (x[1], x[2]) for x in view.layout if x[0] == "file_data"
+    )
+
+    with pytest.raises(zipstream.SourceChangedError):
+        view.read_range(body_start, body_end)
+    with pytest.raises(zipstream.SourceChangedError):
+        view.read_range(0, 1)
