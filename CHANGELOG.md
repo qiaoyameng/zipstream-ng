@@ -1,6 +1,15 @@
 zipstream-ng changelog
 ======================
 
+### [Unreleased]
+- Add an optional `spillover_threshold` parameter to `ZipStream` that writes central
+  directory metadata to a temporary file once the number of streamed files held in
+  memory reaches the threshold, bounding memory usage when streaming archives with
+  many files. The spilled records are replayed in order when the footer is generated
+  and the temporary file is released when the stream is finalized, fails, or is
+  closed early. In this mode `info_list`/`get_info` only report the records still
+  held in memory (`num_streamed` still reports the total).
+
 ### [v1.9.3]
 - Fix length calculation when adding extended ascii filenames (only affects Python 3.13.14+, 3.14.6+, 3.15+)
 

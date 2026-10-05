@@ -11,6 +11,7 @@ import os
 import stat
 import struct
 import sys
+import tempfile
 import time
 import threading
 import warnings
@@ -536,7 +537,7 @@ class ZipStream:
     without using temporary files (ie: web applications).
     """
 
-    def __init__(self, *, compress_type=ZIP_STORED, compress_level=None, sized=False):
+    def __init__(self, *, compress_type=ZIP_STORED, compress_level=None, sized=False, spillover_threshold=None):
         """Create a ZipStream
 
         compress_type:
@@ -576,11 +577,40 @@ class ZipStream:
             If `False` (the default), no restrictions are enforced and using the
             object with the `len()` function will not work (will raise a
             TypeError)
+
+        spillover_threshold:
+            If set to a non-negative integer, the central directory records of
+            streamed files will be written to a temporary file owned by this
+            ZipStream ("spilled to disk") whenever the number of records held
+            in memory reaches this threshold, instead of all of them being
+            kept in memory until the archive footer is generated. The spilled
+            records are replayed from the temporary file in their original
+            order when the footer is generated, so the resulting archive is
+            identical to one generated entirely in memory.
+
+            This bounds the amount of memory used by central directory
+            metadata when streaming archives that contain many files. Note
+            that in this mode `info_list()`/`get_info()` will only include
+            the files whose records haven't been spilled to disk yet - use
+            `num_streamed()` to get the total number of streamed files.
+
+            The temporary file is released once the stream has been
+            finalized, if generating the stream fails, or if the generator
+            is closed early.
+
+            If `None` (the default), all central directory records are kept
+            in memory.
         """
         if compress_type and sized:
             raise ValueError("Cannot use compression with a sized ZipStream")
 
         _check_compression(compress_type, compress_level)
+
+        if spillover_threshold is not None:
+            if not isinstance(spillover_threshold, int) or isinstance(spillover_threshold, bool):
+                raise TypeError("spillover_threshold must be an int or None")
+            if spillover_threshold < 0:
+                raise ValueError("spillover_threshold cannot be negative")
 
         self._compress_type = compress_type
         self._compress_level = compress_level
@@ -590,6 +620,11 @@ class ZipStream:
         # For adding files
         self._filelist = []
         self._queue = collections.deque()
+
+        # For spilling central directory records to disk
+        self._spillover_threshold = spillover_threshold
+        self._spillover_stream = None
+        self._spilled_count = 0
 
         # For calculating the size
         self._sized = sized
@@ -675,7 +710,10 @@ class ZipStream:
         with self._gen_lock:
             if self._final:
                 return
-            yield from self._gen_archive_footer()
+            try:
+                yield from self._gen_archive_footer()
+            finally:
+                self._release_spillover()
 
     def finalize(self):
         """Finish generating the zip stream and finalize it.
@@ -684,8 +722,11 @@ class ZipStream:
         archive footer. To disard the items in the queue instead, see
         `.footer()`.
         """
-        yield from self.all_files()
-        yield from self.footer()
+        try:
+            yield from self.all_files()
+            yield from self.footer()
+        finally:
+            self._release_spillover()
 
     @_validate_final
     @_validate_compression
@@ -902,7 +943,7 @@ class ZipStream:
 
     def is_empty(self):
         """Check if any files have been added to the ZipStream"""
-        return not self._queue and not self._filelist
+        return not self._queue and not self._filelist and not self._spilled_count
 
     def num_queued(self):
         """The number of files queued up to be added to the stream"""
@@ -910,7 +951,7 @@ class ZipStream:
 
     def num_streamed(self):
         """The number of files that have already been added to the stream"""
-        return len(self._filelist)
+        return self._spilled_count + len(self._filelist)
 
     def info_list(self):
         """Get a list of dicts containing data about each file in the ZipStream
@@ -922,6 +963,13 @@ class ZipStream:
         if the file has been written to the ZipStream or not. Files that
         haven't yet been written to the ZipStream will be missing information
         that's only known post-write (compressed size, CRC, datetime, etc.)
+
+        Note that if the ZipStream was created with a `spillover_threshold`,
+        files whose central directory records have been spilled to disk are
+        NOT included in this list - only the records still held in memory are
+        reported. This is intentional: the spilled records are not loaded back
+        into memory just to gather statistics. Use `num_streamed()` to get
+        the total number of streamed files.
         """
         # Need to prevent another thread from popping a result from
         # self._queue, then this function being run before it can be added to
@@ -971,6 +1019,10 @@ class ZipStream:
 
         Note that this ONLY includes files that have already been written to the
         ZipStream. Queued files are NOT included.
+
+        If the ZipStream was created with a `spillover_threshold`, files whose
+        central directory records have been spilled to disk are NOT included
+        either (see `info_list`).
         """
         warnings.warn(
             "ZipStream.get_info is deprecated and will be removed in a future "
@@ -1159,6 +1211,29 @@ class ZipStream:
 
         self._filelist.append(zinfo)
 
+        if (
+            self._spillover_threshold is not None
+            and len(self._filelist) >= self._spillover_threshold
+        ):
+            self._spill_filelist()
+
+    def _spill_filelist(self):
+        """Write the central directory records of the files streamed so far to
+        the spillover stream and drop them from memory"""
+        if self._spillover_stream is None:
+            self._spillover_stream = tempfile.TemporaryFile()
+
+        for zinfo in self._filelist:
+            self._spillover_stream.write(zinfo._central_directory_header_data())
+        self._spilled_count += len(self._filelist)
+        self._filelist.clear()
+
+    def _release_spillover(self):
+        """Close and release the spillover stream if one is in use"""
+        if self._spillover_stream is not None:
+            self._spillover_stream.close()
+            self._spillover_stream = None
+
     def _gen_archive_footer(self):
         """Yield data for the end of central directory record"""
         # Based on zipfile.ZipFile._write_end_record
@@ -1168,12 +1243,21 @@ class ZipStream:
 
         # Write central directory file headers
         centDirOffset = self._pos
+        if self._spillover_stream is not None:
+            # Replay the spilled central directory records in the order the
+            # files were streamed
+            self._spillover_stream.seek(0)
+            while True:
+                data = self._spillover_stream.read(READ_BUFFER)
+                if not data:
+                    break
+                yield self._track(data)
         for zinfo in self._filelist:
             yield self._track(zinfo._central_directory_header_data())
 
         # Write end of central directory record
         zip64EndRecStart = self._pos
-        centDirCount = len(self._filelist)
+        centDirCount = self._spilled_count + len(self._filelist)
         centDirSize = zip64EndRecStart - centDirOffset
         if (centDirCount >= ZIP_FILECOUNT_LIMIT or
             centDirOffset > ZIP64_LIMIT or

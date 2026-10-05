@@ -1766,3 +1766,184 @@ def test_zip64_real(tmpdir):
 
         with zf.open("small.bin", "r") as fp:
             assert smalldata == fp.read()
+
+
+################################
+# Spillover tests
+################################
+
+SPILLOVER_MEMBER_COUNT = 300
+
+def _make_many_member_stream(spillover_threshold):
+    """Create a ZipStream with many small members (files, directories, and
+    unicode names) and an archive comment"""
+    zs = ZipStream(spillover_threshold=spillover_threshold)
+    zs.mkdir("dir/")
+    for i in range(SPILLOVER_MEMBER_COUNT):
+        if i % 3 == 0:
+            zs.add("data-{}".format(i), "dir/file_{:03d}.txt".format(i))
+        elif i % 3 == 1:
+            zs.add(b"\x00" * i, "unicodé_文件_{:03d}.bin".format(i))
+        else:
+            zs.mkdir("dir/sub_{:03d}/".format(i))
+    zs.comment = "archive comment ✓"
+    return zs
+
+
+@pytest.mark.parametrize("threshold", [0, 1, 7, SPILLOVER_MEMBER_COUNT * 2])
+def test_spillover_matches_in_memory(monkeypatch, threshold):
+    """Test that a ZipStream using a spillover threshold generates output
+    identical to one that keeps everything in memory"""
+    faketime = (2024, 5, 6, 7, 8, 8)
+    monkeypatch.setattr(time, "localtime", lambda *_: faketime)
+
+    zs_mem = _make_many_member_stream(None)
+    zs_spill = _make_many_member_stream(threshold)
+    data_mem = bytes(zs_mem)
+    data_spill = bytes(zs_spill)
+
+    # Spilling must only have happened when the threshold is below the
+    # number of members (300 files + the "dir/" entry)
+    assert zs_mem._spilled_count == 0
+    assert zs_spill._spilled_count == (SPILLOVER_MEMBER_COUNT + 1 if threshold <= SPILLOVER_MEMBER_COUNT else 0)
+    assert zs_spill._spillover_stream is None  # released after finalizing
+
+    # The generated archives must be byte-identical (ZIP64 records, offsets,
+    # comment, unicode filenames, and directory entries included)
+    assert data_mem == data_spill
+
+    # The archive must be readable and contain all members in order
+    zf = _get_zip(data_spill)
+    assert zf.comment == "archive comment ✓".encode("utf-8")
+
+    zinfos = zf.infolist()
+    assert len(zinfos) == SPILLOVER_MEMBER_COUNT + 1
+    assert zinfos[0].filename == "dir/"
+    assert zinfos[0].is_dir()
+
+    for i in range(SPILLOVER_MEMBER_COUNT):
+        zinfo = zinfos[i + 1]
+        if i % 3 == 0:
+            assert zinfo.filename == "dir/file_{:03d}.txt".format(i)
+            assert zf.read(zinfo) == "data-{}".format(i).encode("utf-8")
+        elif i % 3 == 1:
+            assert zinfo.filename == "unicodé_文件_{:03d}.bin".format(i)
+            assert zf.read(zinfo) == b"\x00" * i
+        else:
+            assert zinfo.filename == "dir/sub_{:03d}/".format(i)
+            assert zinfo.is_dir()
+
+
+def test_spillover_zip64_counts(monkeypatch):
+    """Test that ZIP64 end-of-archive counts are preserved when spilling"""
+    monkeypatch.setattr(time, "localtime", lambda *_: (2024, 5, 6, 7, 8, 8))
+    monkeypatch.setattr(zipstream.ng, "ZIP_FILECOUNT_LIMIT", 100)
+
+    data_mem = bytes(_make_many_member_stream(None))
+    data_spill = bytes(_make_many_member_stream(5))
+
+    # A ZIP64 end-of-archive record must have been generated in both modes
+    assert zipstream.ng.stringEndArchive64 in data_mem
+    assert data_mem == data_spill
+
+    zf = _get_zip(data_spill)
+    assert len(zf.infolist()) == SPILLOVER_MEMBER_COUNT + 1
+
+
+def test_spillover_info_list(monkeypatch):
+    """Test that info_list/get_info only report the records still held in
+    memory when a spillover threshold is used"""
+    monkeypatch.setattr(time, "localtime", lambda *_: (2024, 5, 6, 7, 8, 8))
+
+    zs = ZipStream(spillover_threshold=10)
+    for i in range(25):
+        zs.add(b"x", "f{:02d}".format(i))
+
+    # Nothing streamed yet - all files are reported as queued
+    info = zs.info_list()
+    assert len(info) == zs.num_queued() == 25
+    assert zs.num_streamed() == 0
+
+    b"".join(zs.all_files())
+
+    # All files are streamed, but only the ones not spilled to disk are
+    # still reported by info_list
+    assert zs.num_streamed() == 25
+    assert zs._spilled_count == 20
+    info = zs.info_list()
+    assert [x["name"] for x in info] == ["f{:02d}".format(i) for i in range(20, 25)]
+    assert all(x["streamed"] for x in info)
+
+    with pytest.warns(DeprecationWarning, match="ZipStream.info_list"):
+        get_info = zs.get_info()
+    assert [x["name"] for x in get_info] == ["f{:02d}".format(i) for i in range(20, 25)]
+
+
+def test_spillover_released_after_finalize():
+    """Test that the spillover stream is released once the stream is finalized"""
+    zs = ZipStream(spillover_threshold=5)
+    for i in range(20):
+        zs.add(b"data", "f{:02d}".format(i))
+
+    stream = None
+    for _ in zs.finalize():
+        if zs._spillover_stream is not None:
+            stream = zs._spillover_stream
+
+    assert stream is not None
+    assert stream.closed
+    assert zs._spillover_stream is None
+
+
+def test_spillover_released_on_source_failure():
+    """Test that the spillover stream is released if generating the stream fails"""
+    def bad_iter():
+        yield b"partial"
+        raise RuntimeError("boom")
+
+    zs = ZipStream(spillover_threshold=2)
+    for i in range(5):
+        zs.add(b"x" * 10, "ok{:02d}".format(i))
+    zs.add(bad_iter(), "bad")
+
+    stream = None
+    with pytest.raises(RuntimeError, match="boom"):
+        for _ in zs.finalize():
+            if zs._spillover_stream is not None:
+                stream = zs._spillover_stream
+
+    assert stream is not None
+    assert stream.closed
+    assert zs._spillover_stream is None
+
+
+def test_spillover_released_on_early_close():
+    """Test that the spillover stream is released if the consumer closes the
+    generator early"""
+    zs = ZipStream(spillover_threshold=2)
+    for i in range(10):
+        zs.add(b"x" * 100, "f{:02d}".format(i))
+
+    gen = zs.finalize()
+    for _ in range(8):  # enough chunks to stream 2 files and trigger a spill
+        next(gen)
+    stream = zs._spillover_stream
+    assert stream is not None
+
+    gen.close()
+    assert stream.closed
+    assert zs._spillover_stream is None
+
+
+def test_spillover_threshold_validation():
+    """Test that invalid spillover thresholds are rejected"""
+    with pytest.raises(TypeError):
+        ZipStream(spillover_threshold="10")
+    with pytest.raises(TypeError):
+        ZipStream(spillover_threshold=True)
+    with pytest.raises(ValueError):
+        ZipStream(spillover_threshold=-1)
+
+    # 0 (spill every record immediately) and None (never spill) are valid
+    ZipStream(spillover_threshold=0)
+    ZipStream(spillover_threshold=None)
