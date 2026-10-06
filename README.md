@@ -176,6 +176,43 @@ def gen_zipfile():
 ```
 
 
+### Multi-volume (spanned) archives
+
+When an export target limits the size of each attachment (e.g. an email or
+upload API), splitting the bytes of a normal ZIP into chunks is not enough:
+the pieces are not valid ZIP volumes. `SpannedZipStream` generates a *real*
+spanned archive following the ZIP multi-disk rules instead.
+
+Each member records the disk its local header starts on, its offset on that
+disk, and the central directory / end records locate themselves across the
+volumes. Local headers, data descriptors, central-directory headers and the
+end-of-central-directory records are never split; a member's (optionally
+compressed) data may cross any number of volumes. Already-delivered volumes
+are never rewritten, and Zip64 records are emitted automatically when needed.
+
+```python
+from zipstream import SpannedZipStream
+
+zss = SpannedZipStream(20 * 1024 * 1024)      # exactly 20 MiB per volume
+zss.add_path("/data/large_folder")
+
+for volume in zss.volumes():
+    # volume.number is the zero-based volume index.
+    # volume.is_final is True only for the final volume.
+    send_attachment(volume.part_name("export.zip"), volume)
+
+if zss.is_complete():
+    print("exported", zss.num_volumes(), "volumes")
+```
+
+Every non-final volume is exactly the configured `volume_size` bytes; the
+final volume may be shorter. `num_volumes()` is `None` until generation
+finishes. If generation fails, the already-produced volumes keep
+`is_final == False` and `is_complete()` returns `False`, so a partial export
+can never be mistaken for a finished archive. If a single indivisible
+structure is larger than `volume_size`, a `VolumeSizeError` is raised.
+
+
 Comparison to stdlib
 --------------------
 Since Python 3.6 it has actually been possible to generate zip files as a stream using just the
