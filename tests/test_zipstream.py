@@ -9,6 +9,7 @@ import logging
 import ntpath
 import os
 import random
+import struct
 import sys
 import time
 import zipfile
@@ -18,6 +19,7 @@ import pytest
 
 import zipstream
 from zipstream import ZipStream
+from zipstream import SpannedZipStream, VolumeTooSmallError
 
 
 PY313 = sys.version_info < (3, 14)
@@ -1764,5 +1766,399 @@ def test_zip64_real(tmpdir):
                 fp.seek(zipfile.ZIP64_LIMIT, io.SEEK_CUR)
             assert enddata == fp.read()
 
-        with zf.open("small.bin", "r") as fp:
-            assert smalldata == fp.read()
+            with zf.open("small.bin", "r") as fp:
+                assert smalldata == fp.read()
+
+
+################################
+# Spanned (multi-volume) zip tests
+################################
+
+class _SpannedZipReader:
+    """Independently reads back a spanned zip archive from its volumes.
+
+    Uses only the multi-disk metadata recorded in the archive (disk numbers
+    and per-disk offsets) to locate the central directory and extract the
+    contents, reassembling structures that span multiple volumes.
+    """
+
+    def __init__(self, volumes):
+        self.volumes = [bytes(v) for v in volumes]
+        assert self.volumes
+        self.comment = None
+        self.entries = []
+        self._read_central_directory()
+
+    def _read_at(self, disk, offset, size):
+        """Read `size` bytes starting at `offset` on `disk`, following the
+        data across disk boundaries as needed"""
+        out = bytearray()
+        while size > 0:
+            chunk = self.volumes[disk][offset:offset + size]
+            assert chunk, "unexpected end of volume"
+            out += chunk
+            size -= len(chunk)
+            disk += 1
+            offset = 0
+        return bytes(out)
+
+    def _disk_offset(self, pos):
+        """Convert an absolute position in the archive to a (disk, offset)"""
+        disk = 0
+        while pos >= len(self.volumes[disk]):
+            pos -= len(self.volumes[disk])
+            disk += 1
+        return disk, pos
+
+    def _read_central_directory(self):
+        # The end of central directory record is located in the last volume
+        last_disk = len(self.volumes) - 1
+        start = self.volumes[-1].rfind(b"PK\x05\x06")
+        assert start >= 0, "no end of central directory record found"
+        eocd = self.volumes[-1][start:start + zipfile.sizeEndCentDir]
+        (sig, disk_no, cd_disk, disk_entries, total_entries, cd_size,
+         cd_offset, comment_len) = struct.unpack(zipfile.structEndArchive, eocd)
+        assert sig == zipfile.stringEndArchive
+        assert disk_no == last_disk
+        assert cd_disk <= last_disk
+        self.comment = self.volumes[-1][
+            start + zipfile.sizeEndCentDir:
+            start + zipfile.sizeEndCentDir + comment_len
+        ]
+
+        # Check for a zip64 end of central directory locator immediately
+        # before the end record (it may be on a previous disk)
+        eocd_pos = sum(len(v) for v in self.volumes[:-1]) + start
+        loc = b""
+        if eocd_pos >= zipfile.sizeEndCentDir64Locator:
+            loc_disk, loc_offset = self._disk_offset(
+                eocd_pos - zipfile.sizeEndCentDir64Locator
+            )
+            loc = self._read_at(loc_disk, loc_offset, zipfile.sizeEndCentDir64Locator)
+        if loc[:4] == zipfile.stringEndArchive64Locator:
+            (_, z64_disk, z64_offset, total_disks) = struct.unpack(
+                zipfile.structEndArchive64Locator, loc
+            )
+            assert total_disks == len(self.volumes)
+            z64 = self._read_at(z64_disk, z64_offset, zipfile.sizeEndCentDir64)
+            fields = struct.unpack(zipfile.structEndArchive64, z64)
+            assert fields[0] == zipfile.stringEndArchive64
+            cd_disk = fields[5]
+            total_entries = fields[7]
+            cd_size = fields[8]
+            cd_offset = fields[9]
+
+        # Read the central directory (it may span multiple disks)
+        cd = self._read_at(cd_disk, cd_offset, cd_size)
+        fp = io.BytesIO(cd)
+        for _ in range(total_entries):
+            centdir = struct.unpack(
+                zipfile.structCentralDir, fp.read(zipfile.sizeCentralDir)
+            )
+            assert centdir[zipfile._CD_SIGNATURE] == zipfile.stringCentralDir
+            filename = fp.read(centdir[zipfile._CD_FILENAME_LENGTH])
+            extra = fp.read(centdir[zipfile._CD_EXTRA_FIELD_LENGTH])
+            fp.read(centdir[zipfile._CD_COMMENT_LENGTH])
+
+            entry = {
+                "filename": filename.decode("utf-8"),
+                "compress_type": centdir[zipfile._CD_COMPRESS_TYPE],
+                "flag_bits": centdir[zipfile._CD_FLAG_BITS],
+                "CRC": centdir[zipfile._CD_CRC],
+                "compress_size": centdir[zipfile._CD_COMPRESSED_SIZE],
+                "file_size": centdir[zipfile._CD_UNCOMPRESSED_SIZE],
+                "disk_start": centdir[zipfile._CD_DISK_NUMBER_START],
+                "header_offset": centdir[zipfile._CD_LOCAL_HEADER_OFFSET],
+            }
+
+            # Decode the zip64 extra field if any values were too big for
+            # the classic record
+            if 0xFFFFFFFF in (entry["compress_size"], entry["file_size"],
+                              entry["header_offset"]) or entry["disk_start"] == 0xFFFF:
+                i = 0
+                while i + 4 <= len(extra):
+                    hid, hlen = struct.unpack_from("<HH", extra, i)
+                    if hid == 0x0001:
+                        body = extra[i + 4:i + 4 + hlen]
+                        pos = 0
+                        for key, fmt in (
+                            ("file_size", "Q"), ("compress_size", "Q"),
+                            ("header_offset", "Q"), ("disk_start", "L"),
+                        ):
+                            marker = 0xFFFF if fmt == "L" else 0xFFFFFFFF
+                            if entry[key] == marker:
+                                entry[key] = struct.unpack_from(
+                                    "<" + fmt, body, pos
+                                )[0]
+                                pos += struct.calcsize(fmt)
+                        break
+                    i += 4 + hlen
+
+            self.entries.append(entry)
+
+    def read(self, filename):
+        """Extract a member, reassembling its data across disks"""
+        entry = next(x for x in self.entries if x["filename"] == filename)
+
+        # The local header starts at the recorded disk and offset
+        lh = self._read_at(
+            entry["disk_start"], entry["header_offset"], zipfile.sizeFileHeader
+        )
+        fields = struct.unpack(zipfile.structFileHeader, lh)
+        assert fields[0] == zipfile.stringFileHeader
+        data_offset = (
+            entry["header_offset"] + zipfile.sizeFileHeader + fields[10] + fields[11]
+        )
+
+        # The compressed data may span multiple disks
+        raw = self._read_at(entry["disk_start"], data_offset, entry["compress_size"])
+
+        if entry["compress_type"] == zipfile.ZIP_STORED:
+            data = raw
+        elif entry["compress_type"] == zipfile.ZIP_DEFLATED:
+            data = zlib.decompress(raw, -15)
+        elif entry["compress_type"] == zipfile.ZIP_BZIP2:
+            import bz2
+            data = bz2.decompress(raw)
+        else:
+            raise ValueError("unsupported compression in test reader")
+
+        assert len(data) == entry["file_size"]
+        assert zlib.crc32(data) & 0xFFFFFFFF == entry["CRC"]
+        return data
+
+
+def test_spanned_invalid_volume_size():
+    """Invalid volume sizes are rejected"""
+    with pytest.raises(ValueError):
+        SpannedZipStream(volume_size=0)
+    with pytest.raises(ValueError):
+        SpannedZipStream(volume_size=-100)
+    with pytest.raises(TypeError):
+        SpannedZipStream(volume_size="1024")
+    with pytest.raises(TypeError):
+        SpannedZipStream(volume_size=True)
+
+
+@pytest.mark.parametrize("ct", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2])
+def test_spanned_roundtrip(ct):
+    """Generate a spanned archive with a small volume size and read it back
+    using an independent reader"""
+    files = {
+        "random.bin": _randbytes(5000),  # incompressible, spans many volumes
+        "text.txt": b"hello world\n" * 200,
+        "empty.txt": b"",
+    }
+
+    zs = SpannedZipStream(volume_size=512, compress_type=ct)
+    zs.comment = "spanned archive comment"
+    for name, data in files.items():
+        zs.add(data, name)
+    zs.mkdir("emptydir")
+
+    assert not zs.complete
+    assert zs.volume_count == 0
+
+    volumes = list(zs.volumes())
+
+    # Volume invariants
+    assert zs.complete
+    assert zs.volume_count == len(volumes)
+    assert len(volumes) > 10  # actually spans many volumes
+    assert all(len(v) <= 512 for v in volumes)
+
+    # Read the archive back independently
+    reader = _SpannedZipReader(volumes)
+    assert reader.comment == b"spanned archive comment"
+    assert sorted(x["filename"] for x in reader.entries) == sorted(
+        list(files) + ["emptydir/"]
+    )
+    for name, data in files.items():
+        assert reader.read(name) == data
+
+
+def test_spanned_member_spanning_many_volumes():
+    """A single member's data is split across many volumes"""
+    data = _randbytes(10000)
+
+    zs = SpannedZipStream(volume_size=64)
+    zs.add(data, "big.bin")
+
+    volumes = list(zs.volumes())
+    assert zs.complete
+    assert len(volumes) > 150
+    assert all(len(v) <= 64 for v in volumes)
+
+    reader = _SpannedZipReader(volumes)
+    assert reader.read("big.bin") == data
+
+
+def test_spanned_single_volume_is_a_normal_zip():
+    """A spanned archive that fits in one volume is a standard zip file"""
+    zs = SpannedZipStream(volume_size=1024 * 1024, compress_type=zipfile.ZIP_DEFLATED)
+    zs.add(b"some data", "file.txt")
+
+    volumes = list(zs.volumes())
+    assert len(volumes) == 1
+    assert zs.complete
+
+    # All disk numbers are 0 so the stdlib can read it directly
+    zf = _get_zip(volumes[0])
+    assert zf.read("file.txt") == b"some data"
+
+
+def test_spanned_empty_archive():
+    """An empty spanned archive is a single volume containing only the
+    end of central directory record"""
+    zs = SpannedZipStream(volume_size=64)
+    volumes = list(zs.volumes())
+    assert zs.complete
+    assert len(volumes) == 1
+    assert len(volumes[0]) == zipfile.sizeEndCentDir
+
+    reader = _SpannedZipReader(volumes)
+    assert reader.entries == []
+
+    # Also readable by the stdlib
+    assert _get_zip(volumes[0]).infolist() == []
+
+
+def test_spanned_zip64(monkeypatch):
+    """Spanned archives using zip64 extensions record multi-disk metadata
+    in the zip64 end of central directory records"""
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 100)
+    monkeypatch.setattr(zipstream.ng, "ZIP64_LIMIT", 100)
+
+    files = {
+        "random.bin": _randbytes(2000),
+        "text.txt": b"abc\n" * 100,
+    }
+
+    zs = SpannedZipStream(volume_size=256, compress_type=zipfile.ZIP_DEFLATED)
+    for name, data in files.items():
+        zs.add(data, name)
+
+    volumes = list(zs.volumes())
+    assert zs.complete
+
+    # The zip64 locator and end record must be present
+    joined = b"".join(volumes)
+    assert zipfile.stringEndArchive64Locator in joined
+    assert zipfile.stringEndArchive64 in joined
+
+    reader = _SpannedZipReader(volumes)
+    for name, data in files.items():
+        assert reader.read(name) == data
+
+
+def test_spanned_zip64_unsized_iterable():
+    """Files added without a known size use zip64 structures that can
+    also span volumes"""
+    data = _randbytes(10240)
+
+    def gen():
+        for i in range(0, len(data), 1024):
+            yield data[i:i + 1024]
+
+    zs = SpannedZipStream(volume_size=128)
+    zs.add(gen(), "rand.txt")  # no size -> forced zip64
+
+    volumes = list(zs.volumes())
+    assert zs.complete
+
+    reader = _SpannedZipReader(volumes)
+    assert reader.read("rand.txt") == data
+
+
+def test_spanned_atomic_structure_too_large():
+    """A single indivisible structure larger than the volume size fails
+    explicitly"""
+    # A local header (30 bytes + filename) bigger than the volume
+    zs = SpannedZipStream(volume_size=20)
+    zs.add(b"data", "a_fairly_long_file_name.txt")
+    with pytest.raises(VolumeTooSmallError):
+        list(zs.volumes())
+    assert not zs.complete
+    assert zs.volume_count == 0
+
+    # The end of central directory record (22 bytes) doesn't fit
+    zs = SpannedZipStream(volume_size=10)
+    with pytest.raises(VolumeTooSmallError):
+        list(zs.volumes())
+    assert not zs.complete
+
+    # The central directory record doesn't fit but the local header and
+    # file data do - some volumes are delivered before the failure
+    zs = SpannedZipStream(volume_size=64)
+    zs.add(b"x" * 500, "x" * 30)  # local header is 60 bytes, central record 76
+    with pytest.raises(VolumeTooSmallError):
+        list(zs.volumes())
+    assert not zs.complete
+    assert zs.volume_count > 0
+
+
+def test_spanned_failure_does_not_mark_complete():
+    """If generation fails partway through, the volumes delivered so far
+    are not marked as a complete archive"""
+    def broken_iter():
+        yield _randbytes(500)
+        yield _randbytes(500)
+        raise RuntimeError("source data failed")
+
+    zs = SpannedZipStream(volume_size=100)
+    zs.add(b"ok", "ok.txt")
+    zs.add(broken_iter(), "broken.txt", size=1000)
+
+    delivered = []
+    with pytest.raises(RuntimeError):
+        for volume in zs.volumes():
+            delivered.append(volume)
+
+    # Some volumes were delivered but the archive is not complete
+    assert delivered
+    assert not zs.complete
+    assert zs.volume_count == len(delivered)
+    # The delivered volumes contain no end of central directory record and
+    # so can't be mistaken for a complete archive
+    assert b"PK\x05\x06" not in b"".join(delivered)
+
+
+def test_spanned_partial_consumption_not_complete():
+    """Only fully generating all volumes marks the archive complete"""
+    zs = SpannedZipStream(volume_size=100)
+    zs.add(_randbytes(5000), "big.bin")
+
+    gen = zs.volumes()
+    next(gen)
+    assert zs.volume_count == 1
+    assert not zs.complete
+
+    # Finish generating
+    rest = list(gen)
+    assert zs.complete
+    assert zs.volume_count == 1 + len(rest)
+
+
+def test_spanned_finalized():
+    """A finalized SpannedZipStream can't be added to or regenerated"""
+    zs = SpannedZipStream(volume_size=100)
+    zs.add(b"data", "file.txt")
+    list(zs.volumes())
+    assert zs.complete
+
+    with pytest.raises(RuntimeError):
+        zs.add(b"more", "more.txt")
+    with pytest.raises(RuntimeError):
+        list(zs.volumes())
+
+
+def test_spanned_cannot_mix_streaming_and_volumes():
+    """Files already streamed without volume information can't be
+    retroactively assigned to volumes"""
+    zs = SpannedZipStream(volume_size=100)
+    zs.add(b"data", "file.txt")
+    b"".join(zs.file())  # stream the file outside of volume generation
+
+    with pytest.raises(RuntimeError):
+        list(zs.volumes())
+    assert not zs.complete

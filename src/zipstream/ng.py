@@ -44,6 +44,15 @@ _FLAG_DATA_DESCRIPTOR = 1 << 3
 _FLAG_IS_DIRECTORY = 1 << 4
 _FLAG_UTF8_FILENAME = 1 << 11
 
+# Segment types used when generating a zip in discrete pieces. All segment
+# types except _SEGMENT_FILE_DATA are atomic - they describe a single
+# structure that must never be split across volumes when spanning.
+_SEGMENT_LOCAL_HEADER = "local_header"
+_SEGMENT_FILE_DATA = "file_data"
+_SEGMENT_DATA_DESCRIPTOR = "data_descriptor"
+_SEGMENT_CENTRAL_DIRECTORY = "central_directory"
+_SEGMENT_END_RECORD = "end_record"
+
 # Size of chunks to read out of files
 # Note that when compressing data the compressor will operate on bigger chunks
 # than this - it keeps a cache as new chunks are fed to it.
@@ -72,6 +81,7 @@ if not PY313_COMPAT:
 __all__ = [
     # Defined classes
     "ZipStream", "ZipStreamInfo",
+    "SpannedZipStream", "VolumeTooSmallError",
     # Compression constants (imported from zipfile)
     "ZIP_STORED",
     "ZIP_DEFLATED",
@@ -154,6 +164,11 @@ class ZipStreamInfo(ZipInfo):
             date_time = min(max(MIN_DATE, date_time), MAX_DATE)
 
         super().__init__(filename, date_time)
+
+        # The disk (volume) number that the start of this entry's local
+        # header resides on. Only nonzero for spanned (multi-volume)
+        # archives - see SpannedZipStream.
+        self.disk_start = 0
 
     # Overwrite ZipInfo._encodeFilenameFlags to only use ascii/utf-8.
     # As of python/cpython#150091 Python will attempt to encode the filename
@@ -252,6 +267,15 @@ class ZipStreamInfo(ZipInfo):
         If `force_zip64` is True (not default), then zip64 extensions will
         always be used for storing files (not directories).
         """
+        for _, data in self._file_data_segments(iterable, force_zip64=force_zip64):
+            yield data
+
+    def _file_data_segments(self, iterable=None, force_zip64=False):
+        """Segmented version of `._file_data()`
+
+        Yields (segment_type, data) tuples where segment_type is one of
+        _SEGMENT_LOCAL_HEADER, _SEGMENT_FILE_DATA, or _SEGMENT_DATA_DESCRIPTOR.
+        """
         # Based on the code in zipfile.ZipFile.write, zipfile._ZipWriteFile.{write,close}
 
         if self.compress_type == ZIP_LZMA:
@@ -264,7 +288,7 @@ class ZipStreamInfo(ZipInfo):
             self.compress_size = 0
             self.file_size = 0
             self.flag_bits &= ~_FLAG_DATA_DESCRIPTOR
-            yield self.FileHeader(zip64=False)
+            yield _SEGMENT_LOCAL_HEADER, self.FileHeader(zip64=False)
             return
 
         if not iterable:  # pragma: no cover
@@ -278,7 +302,7 @@ class ZipStreamInfo(ZipInfo):
         zip64 = force_zip64 or self.file_size * ZIP64_ESTIMATE_FACTOR > ZIP64_LIMIT
 
         # Make header
-        yield self.FileHeader(zip64)
+        yield _SEGMENT_LOCAL_HEADER, self.FileHeader(zip64)
 
         # Store/compress the data while keeping track of size and CRC
         if not PY36_COMPAT:
@@ -295,13 +319,13 @@ class ZipStreamInfo(ZipInfo):
             if cmpr:
                 buf = cmpr.compress(buf)
                 compress_size += len(buf)
-            yield buf
+            yield _SEGMENT_FILE_DATA, buf
 
         if cmpr:
             buf = cmpr.flush()
             if buf:
                 compress_size += len(buf)
-                yield buf
+                yield _SEGMENT_FILE_DATA, buf
         else:
             compress_size = file_size
 
@@ -319,7 +343,7 @@ class ZipStreamInfo(ZipInfo):
             )
 
         # Yield the data descriptor with the now-valid CRC and file size info
-        yield self.DataDescriptor(zip64)
+        yield _SEGMENT_DATA_DESCRIPTOR, self.DataDescriptor(zip64)
 
     def _central_directory_header_data(self):
         """Return a central directory file header for this file"""
@@ -331,8 +355,8 @@ class ZipStreamInfo(ZipInfo):
         # Store sizes and offsets in the extra data if they're too big
         # for the normal spot
         if max(self.file_size, self.compress_size) > ZIP64_LIMIT:
-            extra.append(self.file_size)
-            extra.append(self.compress_size)
+            extra.append(("Q", self.file_size))
+            extra.append(("Q", self.compress_size))
             file_size = 0xFFFFFFFF
             compress_size = 0xFFFFFFFF
         else:
@@ -340,10 +364,17 @@ class ZipStreamInfo(ZipInfo):
             compress_size = self.compress_size
 
         if self.header_offset > ZIP64_LIMIT:
-            extra.append(self.header_offset)
+            extra.append(("Q", self.header_offset))
             header_offset = 0xFFFFFFFF
         else:
             header_offset = self.header_offset
+
+        # The disk number the start of this entry resides on (only nonzero
+        # for spanned archives)
+        disk_start = self.disk_start
+        if disk_start > 0xFFFF:
+            extra.append(("L", disk_start))
+            disk_start = 0xFFFF
 
         extra_data = self.extra
         min_version = 0
@@ -354,7 +385,10 @@ class ZipStreamInfo(ZipInfo):
             # ZipStreamInfo records, there shouldn't ever be any so we don't
             # bother.
             extra_data = struct.pack(
-                "<HH" + "Q"*len(extra), 1, 8*len(extra), *extra
+                "<HH" + "".join(x[0] for x in extra),
+                1,  # Zip64 extended information extra field identifier
+                sum(struct.calcsize(x[0]) for x in extra),
+                *(x[1] for x in extra)
             ) + extra_data
             min_version = ZIP64_VERSION
 
@@ -379,7 +413,7 @@ class ZipStreamInfo(ZipInfo):
             len(filename),
             len(extra_data),
             len(self.comment),
-            0,  # disk number this file begins on
+            disk_start,
             self.internal_attr,
             self.external_attr,
             header_offset
@@ -1090,6 +1124,19 @@ class ZipStream:
 
     def _gen_file_entry(self, *, path=None, iterable=None, data=None, size=None, arcname, compress_type=None, compress_level=None):
         """Yield the zipped data generated by the specified path/iterator/data"""
+        for _, segment in self._gen_file_entry_segments(
+            path=path, iterable=iterable, data=data, size=size,
+            arcname=arcname, compress_type=compress_type,
+            compress_level=compress_level
+        ):
+            yield segment
+
+    def _gen_file_entry_segments(self, *, path=None, iterable=None, data=None, size=None, arcname, compress_type=None, compress_level=None):
+        """Segmented version of `._gen_file_entry()`
+
+        Yields (segment_type, data) tuples. See
+        `ZipStreamInfo._file_data_segments()` for the segment types.
+        """
         assert bool(path) ^ bool(iterable) ^ bool(data is not None)
         assert not (self._sized and size is None)
 
@@ -1136,8 +1183,8 @@ class ZipStream:
             iterable = gen()
 
         # Generate the file data
-        for x in zinfo._file_data(iterable, force_zip64=force_zip64):
-            yield self._track(x)
+        for segment_type, x in zinfo._file_data_segments(iterable, force_zip64=force_zip64):
+            yield segment_type, self._track(x)
 
         if size is not None and size != zinfo.file_size:
             # The size of the data that was stored didn't match what was
@@ -1284,3 +1331,303 @@ class ZipStream:
 
             # Record the current progress for next time
             self._size_prog = (num_files, files_size, cdfh_size)
+
+
+class VolumeTooSmallError(ValueError):
+    """Raised when an indivisible zip structure cannot fit in a single volume
+
+    Only compressed file data may span volumes. All other zip structures
+    (local file headers, data descriptors, central directory records, and the
+    end of central directory records) are atomic - if one of them is larger
+    than the configured volume size the archive cannot be generated.
+    """
+
+
+class SpannedZipStream(ZipStream):
+    """A ZipStream that generates a spanned (multi-volume) zip archive
+
+    Instead of producing a single stream of bytes like `ZipStream`, the
+    `.volumes()` method of this class yields a sequence of volumes, each at
+    most `volume_size` bytes. Concatenating the volumes in order produces
+    the full archive, but unlike naively splitting a normal zip at arbitrary
+    byte offsets, the multi-disk fields of the zip format (the disk each
+    member starts on, the per-disk offsets, the central directory location,
+    and the end of central directory records, including their Zip64
+    variants) are all populated according to the ZIP specification. This
+    makes the output a proper spanned archive that unarchivers with
+    multi-disk support can reassemble.
+
+    Only compressed file data is ever split across volumes. Zip structures
+    (local file headers, data descriptors, central directory records, and
+    the end records) are atomic and always start on a fresh volume if they
+    don't fit in the remaining space of the current one. If a single
+    structure is larger than `volume_size`, a `VolumeTooSmallError` is
+    raised.
+
+    Since volumes are delivered in order and can never be rewritten once
+    yielded, a failure partway through generation (for example a file
+    growing beyond what Zip64 estimation predicted, or an oversized
+    structure) invalidates the whole archive. The `.complete` property
+    stays `False` in this case so already-delivered volumes are never
+    mistaken for a complete archive.
+    """
+
+    def __init__(self, *, volume_size, compress_type=ZIP_STORED, compress_level=None):
+        """Create a SpannedZipStream
+
+        volume_size:
+            The maximum size of each volume in bytes. Must be a positive
+            integer. Every volume except possibly the last one will be
+            exactly this size.
+
+        `compress_type` and `compress_level` work the same as in `ZipStream`.
+        Note that a SpannedZipStream is never `sized` - the number and
+        content of the volumes is only known while generating them.
+        """
+        if isinstance(volume_size, bool) or not isinstance(volume_size, int):
+            raise TypeError("volume_size must be an integer")
+        if volume_size <= 0:
+            raise ValueError("volume_size must be a positive integer")
+
+        super().__init__(
+            compress_type=compress_type,
+            compress_level=compress_level,
+            sized=False
+        )
+        self._volume_size = volume_size
+        self._volumes_generated = 0
+        self._complete = False
+
+    @property
+    def volume_size(self):
+        """The maximum size of each generated volume in bytes"""
+        return self._volume_size
+
+    @property
+    def volume_count(self):
+        """The number of volumes generated so far
+
+        Once `.complete` is True this is the total number of volumes in the
+        archive.
+        """
+        return self._volumes_generated
+
+    @property
+    def complete(self):
+        """True if the final volume of the archive has been generated
+
+        If generation fails partway through, this stays False, indicating
+        that the volumes generated so far do NOT form a complete archive
+        and must be discarded.
+        """
+        return self._complete
+
+    def volumes(self):
+        """Generate the archive as a sequence of volumes
+
+        Yields the bytes of each volume in order. Volumes must be stored
+        and reassembled in the order they are yielded (commonly using
+        extensions like .zip, .z01, .z02, ... or .zip.001, .zip.002, ...).
+
+        Once the generator is exhausted, `.volume_count` is the total
+        number of volumes and `.complete` is True. If any exception is
+        raised during generation (including `VolumeTooSmallError` when an
+        indivisible structure exceeds the volume size), the volumes that
+        were already yielded are not a usable archive and `.complete` will
+        remain False.
+
+        Raises a RuntimeError if the archive has already been finalized.
+        """
+        if self._final:
+            raise RuntimeError("SpannedZipStream has already been finalized")
+        if self._filelist:
+            raise RuntimeError(
+                "Cannot generate volumes - some files have already been "
+                "streamed without volume information"
+            )
+        yield from self._gen_volumes()
+
+    def _gen_volumes(self):
+        """Generate the volumes of the spanned archive"""
+        volume = bytearray()
+        disk = 0
+        member_starts = []  # (disk, offset) of each local header, in order
+
+        # Stream all the queued files, packing the generated segments into
+        # volumes. File data may be split across volumes at any byte
+        # boundary; all other structures are atomic.
+        while not self._final and self._queue:
+            kwargs = self._queue.popleft()
+            with self._gen_lock:
+                segments = self._gen_file_entry_segments(**kwargs)
+                for segment_type, segment in segments:
+                    if segment_type == _SEGMENT_FILE_DATA:
+                        view = memoryview(segment)
+                        while view:
+                            space = self._volume_size - len(volume)
+                            if not space:
+                                self._volumes_generated += 1
+                                yield bytes(volume)
+                                disk += 1
+                                volume = bytearray()
+                                space = self._volume_size
+                            volume += view[:space]
+                            view = view[space:]
+                    else:
+                        if len(segment) > self._volume_size:
+                            raise VolumeTooSmallError(
+                                "A {} ({} bytes) cannot fit in a {} byte "
+                                "volume".format(
+                                    segment_type.replace("_", " "),
+                                    len(segment),
+                                    self._volume_size
+                                )
+                            )
+                        if len(volume) + len(segment) > self._volume_size:
+                            self._volumes_generated += 1
+                            yield bytes(volume)
+                            disk += 1
+                            volume = bytearray()
+                        if segment_type == _SEGMENT_LOCAL_HEADER:
+                            member_starts.append((disk, len(volume)))
+                        volume += segment
+
+        # Record which disk each member starts on and its offset within
+        # that disk so the central directory records them correctly
+        for zinfo, (start_disk, start_offset) in zip(self._filelist, member_starts):
+            zinfo.disk_start = start_disk
+            zinfo.header_offset = start_offset
+
+        # Generate and pack the footer (central directory and end records).
+        # The whole footer is generated before any of it is packed so that
+        # a failure here can't leave a partially-written footer behind.
+        for segment in self._spanned_footer_segments(disk, len(volume)):
+            if len(volume) + len(segment) > self._volume_size:
+                self._volumes_generated += 1
+                yield bytes(volume)
+                disk += 1
+                volume = bytearray()
+            volume += segment
+
+        # The last volume always contains the end of central directory
+        # record, marking the archive as complete
+        self._volumes_generated += 1
+        self._complete = True
+        yield bytes(volume)
+
+    def _spanned_footer_segments(self, disk, offset):
+        """Generate the footer of the spanned archive as a list of segments
+
+        `disk` and `offset` describe where the central directory will start
+        (the current volume and the position within it). Returns a list of
+        atomic segments with all multi-disk fields populated.
+        """
+        # Mark the stream as finalized so no more files can be added to it
+        self._final = True
+
+        centdir_data = []
+        for zinfo in self._filelist:
+            data = zinfo._central_directory_header_data()
+            if len(data) > self._volume_size:
+                raise VolumeTooSmallError(
+                    "A central directory record ({} bytes) cannot fit in a "
+                    "{} byte volume".format(len(data), self._volume_size)
+                )
+            centdir_data.append(data)
+
+        centdir_count = len(centdir_data)
+        centdir_size = sum(map(len, centdir_data))
+
+        # Simulate packing the footer into volumes so the disk layout is
+        # known before the end records (which reference it) are generated
+        entries_per_disk = collections.Counter()
+        centdir_start_disk = centdir_start_offset = None
+        for data in centdir_data:
+            if offset + len(data) > self._volume_size:
+                disk += 1
+                offset = 0
+            if centdir_start_disk is None:
+                centdir_start_disk = disk
+                centdir_start_offset = offset
+            entries_per_disk[disk] += 1
+            offset += len(data)
+        if centdir_start_disk is None:
+            # No entries - the central directory is empty
+            centdir_start_disk = disk
+            centdir_start_offset = offset
+
+        def _place(size, what):
+            nonlocal disk, offset
+            if size > self._volume_size:
+                raise VolumeTooSmallError(
+                    "A {} ({} bytes) cannot fit in a {} byte volume".format(
+                        what, size, self._volume_size
+                    )
+                )
+            if offset + size > self._volume_size:
+                disk += 1
+                offset = 0
+            position = (disk, offset)
+            offset += size
+            return position
+
+        # Zip64 end records are required when any of the values they encode
+        # exceed the limits of the classic end of central directory record
+        need_zip64 = (
+            centdir_count >= ZIP_FILECOUNT_LIMIT or
+            centdir_size > ZIP64_LIMIT or
+            centdir_start_offset > ZIP64_LIMIT or
+            centdir_start_disk > 0xFFFF or
+            disk > 0xFFFF
+        )
+
+        # Place all the end records first so the total number of disks is
+        # known before generating them (the zip64 locator records it)
+        if need_zip64:
+            zip64_disk, zip64_offset = _place(
+                sizeEndCentDir64, "zip64 end of central directory record"
+            )
+            _place(sizeEndCentDir64Locator, "zip64 end of central directory locator")
+        eocd_disk, _ = _place(
+            sizeEndCentDir + len(self._comment),
+            "end of central directory record"
+        )
+        total_disks = disk + 1
+
+        segments = list(centdir_data)
+
+        if need_zip64:
+            segments.append(struct.pack(
+                structEndArchive64,
+                stringEndArchive64,
+                44,  # size of this record after this point
+                ZIP64_VERSION,  # version made by
+                ZIP64_VERSION,  # version needed to extract
+                zip64_disk,
+                centdir_start_disk,
+                entries_per_disk.get(zip64_disk, 0),
+                centdir_count,
+                centdir_size,
+                centdir_start_offset,
+            ))
+            segments.append(struct.pack(
+                structEndArchive64Locator,
+                stringEndArchive64Locator,
+                zip64_disk,
+                zip64_offset,
+                total_disks,
+            ))
+
+        segments.append(struct.pack(
+            structEndArchive,
+            stringEndArchive,
+            min(eocd_disk, 0xFFFF),
+            min(centdir_start_disk, 0xFFFF),
+            min(entries_per_disk.get(eocd_disk, 0), 0xFFFF),
+            min(centdir_count, 0xFFFF),
+            min(centdir_size, 0xFFFFFFFF),
+            min(centdir_start_offset, 0xFFFFFFFF),
+            len(self._comment)
+        ) + self._comment)
+
+        return segments

@@ -21,6 +21,7 @@ calculate the final size of the zip file before streaming it.
  - Threadsafe: Won't mangle data if multiple threads concurrently add data to the same stream.
  - Includes a clone of Python's `http.server` module with zip support added. Try `python -m zipstream.server`.
  - Automatically uses Zip64 extensions, but only if they are required.
+ - Can generate spanned (multi-volume) zip archives with a maximum size per volume.
  - No external dependencies.
 
 
@@ -174,6 +175,39 @@ def gen_zipfile():
     )
     yield from zs.finalize()
 ```
+
+
+### Spanned (multi-volume) archives
+
+When each output file has a size limit (for example attachments on an export endpoint), use
+`SpannedZipStream` to generate a proper spanned zip archive instead of splitting a normal zip at
+arbitrary byte offsets. The `.volumes()` method yields each volume in order; every volume except
+possibly the last one is exactly `volume_size` bytes. All the multi-disk fields of the zip format
+(the disk each member starts on, per-disk offsets, the central directory location, and the end
+records, including Zip64 variants) are populated according to the ZIP specification.
+
+```python
+from zipstream import SpannedZipStream
+
+zs = SpannedZipStream(volume_size=10 * 1024**2)  # 10MB per volume
+zs.add_path("/path/to/files")
+
+for i, volume in enumerate(zs.volumes()):
+    with open("files.zip.%03d" % (i + 1), "wb") as fp:
+        fp.write(volume)
+
+if not zs.complete:
+    # Generation failed - the volumes written so far are not a usable
+    # archive and must be discarded.
+    raise RuntimeError("Failed to generate the archive")
+print("Wrote", zs.volume_count, "volumes")
+```
+
+Only compressed file data is ever split across volumes. Zip structures (local headers, data
+descriptors, central directory records, and the end records) are atomic - if one of them is
+larger than `volume_size`, a `VolumeTooSmallError` is raised. Since volumes are delivered in
+order and are never rewritten, a failure partway through generation leaves `.complete` as
+`False` so the already-delivered volumes can't be mistaken for a complete archive.
 
 
 Comparison to stdlib

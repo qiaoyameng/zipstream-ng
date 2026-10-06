@@ -1,6 +1,14 @@
 zipstream-ng changelog
 ======================
 
+### [Unreleased]
+- Add `SpannedZipStream` for generating spanned (multi-volume) zip archives. The `.volumes()`
+  method yields volumes of at most a configured size, with all multi-disk metadata (member start
+  disks, per-disk offsets, central directory location, and end records, including Zip64 variants)
+  recorded according to the ZIP specification. Indivisible structures that exceed the volume size
+  raise `VolumeTooSmallError`, and the `.complete`/`.volume_count` properties report the final
+  generation status and total volume count.
+
 ### [v1.9.3]
 - Fix length calculation when adding extended ascii filenames (only affects Python 3.13.14+, 3.14.6+, 3.15+)
 
